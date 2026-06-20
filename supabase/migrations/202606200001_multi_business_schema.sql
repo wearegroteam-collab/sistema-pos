@@ -6,7 +6,7 @@ do $$ begin
 exception when duplicate_object then null; end $$;
 
 do $$ begin
-  create type public.record_status as enum ('active', 'inactive');
+  create type public.record_status as enum ('active', 'inactive', 'deleted');
 exception when duplicate_object then null; end $$;
 
 do $$ begin

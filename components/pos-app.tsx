@@ -57,6 +57,7 @@ const now = () => new Date().toISOString();
 const money = new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 });
 type MainTab = "mesas" | "menu" | "ordenes" | "reportes" | "ajustes";
 type SuperAdminTab = "businesses" | "invitations" | "checklist";
+type BusinessFilter = "all" | "real" | "demo" | "active" | "inactive" | "deleted";
 type MenuTab = "categorias" | "productos" | "adiciones" | "vinculos";
 type SettingsTab = "negocio" | "recibo" | "comanda" | "pagos" | "usuarios" | "impresion" | "cobro";
 type PrintMode = "comanda" | "recibo" | "detalle" | null;
@@ -349,11 +350,13 @@ function mapBusinessRow(row: Record<string, unknown>): Business {
     phone: String(row.phone ?? ""),
     email: String(row.email ?? ""),
     nit: row.nit ? String(row.nit) : "",
-    status: row.status === "inactive" ? "inactive" : "active",
+    status: row.status === "deleted" ? "deleted" : row.status === "inactive" ? "inactive" : "active",
     testMode: Boolean(row.test_mode),
     demo: Boolean(row.demo),
     onboardingCompleted: Boolean(row.onboarding_completed),
-    onboardingSkipped: Boolean(row.onboarding_skipped)
+    onboardingSkipped: Boolean(row.onboarding_skipped),
+    createdAt: String(row.created_at ?? now()),
+    lastActivityAt: row.last_activity_at ? String(row.last_activity_at) : undefined
   });
 }
 
@@ -410,6 +413,7 @@ export function PosApp() {
   const [login, setLogin] = useState({ email: "", password: "" });
   const [loginError, setLoginError] = useState("");
   const [authLoading, setAuthLoading] = useState(true);
+  const [supportBusinessId, setSupportBusinessId] = useState<string | null>(null);
 
   const currentUser = session?.email ?? "Usuario";
   const isSuperAdminRoute = initialPath.startsWith("/super-admin");
@@ -417,6 +421,7 @@ export function PosApp() {
   const can = (permission: keyof CashierPermissions) => role === "super_admin" || role === "admin" || Boolean(currentBusinessUser?.permissions[permission] ?? settings.cashierPermissions[permission]);
   const activeShift = shifts.find((shift) => shift.businessId === activeBusinessId && shift.status === "abierto" && !shift.testMode) ?? null;
   const currentBusiness = normalizeBusiness(businesses.find((item) => item.id === activeBusinessId) ?? business);
+  const isSupportMode = role === "super_admin" && Boolean(supportBusinessId);
 
   useEffect(() => {
     const saved = window.localStorage.getItem("simple-pos-state");
@@ -722,7 +727,29 @@ export function PosApp() {
     setSession(null);
     setRole("admin");
     setActiveBusinessId(initialBusiness.id);
+    setSupportBusinessId(null);
     setLogin({ email: "", password: "" });
+  }
+
+  async function enterSupportMode(businessId: string) {
+    if (role !== "super_admin") return;
+    setActiveBusinessId(businessId);
+    setSupportBusinessId(businessId);
+    setTab("mesas");
+    if (supabase && session?.userId) {
+      await supabase.from("audit_logs").insert({
+        business_id: businessId,
+        user_id: session.userId,
+        user_name: session.email,
+        action: "super_admin_support_entered",
+        metadata: { email: session.email }
+      });
+    }
+  }
+
+  function exitSupportMode() {
+    setSupportBusinessId(null);
+    setActiveBusinessId(initialBusiness.id);
   }
 
   if (authLoading && !session) {
@@ -755,15 +782,15 @@ export function PosApp() {
     return <main className="grid min-h-screen place-items-center bg-surface p-4"><NoPermission /></main>;
   }
 
-  if (role === "super_admin") {
+  if (role === "super_admin" && !isSupportMode) {
     if (!isSuperAdminRoute && typeof window !== "undefined") {
       window.location.replace("/super-admin");
       return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-xl font-black">Redirigiendo...</h1></section></main>;
     }
-    return <SuperAdminPanel businesses={businesses} setBusinesses={setBusinesses} users={businessUsers} setUsers={setBusinessUsers} invitations={invitations} setInvitations={setInvitations} onSupport={(businessId) => { setActiveBusinessId(businessId); setRole("admin"); }} onLogout={handleLogout} />;
+    return <SuperAdminPanelV2 businesses={businesses} setBusinesses={setBusinesses} users={businessUsers} setUsers={setBusinessUsers} invitations={invitations} setInvitations={setInvitations} orders={orders} onSupport={enterSupportMode} onLogout={handleLogout} />;
   }
 
-  if (!activeShift && !currentBusiness.testMode && (currentBusiness.onboardingCompleted || currentBusiness.onboardingSkipped)) {
+  if (!isSupportMode && !activeShift && !currentBusiness.testMode && (currentBusiness.onboardingCompleted || currentBusiness.onboardingSkipped)) {
     return (
       <main className="min-h-screen bg-surface">
         <header className="border-b border-line bg-white">
@@ -783,11 +810,15 @@ export function PosApp() {
     );
   }
 
-  if (currentBusiness.status === "inactive") {
+  if (!isSupportMode && currentBusiness.status === "inactive") {
     return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="max-w-md rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-2xl font-black">Negocio inactivo</h1><p className="mt-2 text-slate-600">Este negocio esta desactivado. Contacta al administrador del sistema.</p><button className="mt-4 rounded-md border border-line px-4 py-2 font-bold" onClick={handleLogout}>Salir</button></section></main>;
   }
 
-  if (!currentBusiness.onboardingCompleted && !currentBusiness.onboardingSkipped) {
+  if (currentBusiness.status === "deleted") {
+    return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="max-w-md rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-2xl font-black">Negocio eliminado</h1><p className="mt-2 text-slate-600">Este negocio esta marcado como eliminado y no puede operar.</p><button className="mt-4 rounded-md border border-line px-4 py-2 font-bold" onClick={isSupportMode ? exitSupportMode : handleLogout}>Volver</button></section></main>;
+  }
+
+  if (!isSupportMode && !currentBusiness.onboardingCompleted && !currentBusiness.onboardingSkipped) {
     if (role !== "admin") {
       return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="max-w-md rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-2xl font-black">Configuracion pendiente</h1><p className="mt-2 text-slate-600">El admin debe completar o saltar el onboarding antes de operar el POS.</p><button className="mt-4 rounded-md border border-line px-4 py-2 font-bold" onClick={handleLogout}>Salir</button></section></main>;
     }
@@ -804,12 +835,14 @@ export function PosApp() {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             {currentBusiness.testMode && <span className="rounded-md bg-yellow-100 px-3 py-2 text-sm font-bold text-yellow-900">Modo prueba activo: las ordenes no afectaran reportes reales.</span>}
+            {isSupportMode && <span className="rounded-md bg-sky-100 px-3 py-2 text-sm font-bold text-sky-900">Estas viendo este negocio como Super Admin</span>}
             {!currentBusiness.testMode && activeShift && <span className="rounded-md bg-emerald-100 px-3 py-2 text-sm font-bold text-emerald-800">Turno abierto · {activeShift.cashier}</span>}
             {!currentBusiness.testMode && can("closeShift") && <button className="rounded-md border border-line bg-white px-3 py-2 font-semibold" onClick={() => setShowCloseShift(true)}>Cerrar turno</button>}
             {role === "admin" && <button className="rounded-md border border-line bg-white px-3 py-2 font-semibold" onClick={() => setBusinesses((current) => current.map((item) => item.id === activeBusinessId ? { ...item, testMode: !item.testMode } : item))}>{currentBusiness.testMode ? "Apagar prueba" : "Modo prueba"}</button>}
             {role === "admin" && <button className="rounded-md border border-line bg-white px-3 py-2 font-semibold" onClick={() => { setOrders((current) => current.filter((order) => !(order.businessId === activeBusinessId && order.testMode))); setShifts((current) => current.filter((shift) => !(shift.businessId === activeBusinessId && shift.testMode))); }}>Limpiar prueba</button>}
             <span className="rounded-md border border-line bg-surface px-3 py-2 text-sm">{session.email}</span>
             <span className="rounded-md border border-line bg-surface px-3 py-2 text-sm">{hasSupabaseConfig ? "Supabase configurado" : "Modo local"}</span>
+            {isSupportMode && <button className="rounded-md bg-brand px-3 py-2 font-semibold text-white" onClick={exitSupportMode}>Volver a Super Admin</button>}
             <button className="rounded-md border border-line bg-white px-3 py-2 font-semibold" onClick={handleLogout}>Salir</button>
           </div>
         </div>
@@ -1004,6 +1037,57 @@ function SuperAdminPanel({ businesses, setBusinesses, users, setUsers, invitatio
   }
   const detail = businesses.find((business) => business.id === detailId);
   return <main className="min-h-screen bg-surface"><header className="border-b border-line bg-white"><div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-4"><div><p className="text-sm font-bold text-brand">Super Admin</p><h1 className="text-2xl font-black">Panel del sistema</h1></div><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={onLogout}>Salir</button></div></header><section className="mx-auto max-w-7xl space-y-4 px-4 py-5"><InnerTabs current={tab} onChange={setTab} tabs={[{ id: "businesses", label: "Negocios" }, { id: "invitations", label: "Invitaciones" }, { id: "checklist", label: "Checklist" }]} />{tab === "businesses" && <><SettingsCard title="Crear negocio"><div className="grid gap-3 md:grid-cols-[1fr_1fr_180px_160px_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Nombre del negocio" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" placeholder="Correo admin" value={draft.email} onChange={(event) => setDraft({ ...draft, email: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" placeholder="Telefono" value={draft.phone} onChange={(event) => setDraft({ ...draft, phone: event.target.value })} /><select className="min-h-11 rounded-md border border-line px-3" value={draft.kind} onChange={(event) => setDraft({ ...draft, kind: event.target.value as "real" | "demo" })}><option value="real">Real</option><option value="demo">Demo</option></select><button className="rounded-md bg-brand px-4 font-bold text-white" onClick={createBusiness}>Crear</button></div><p className="mt-2 text-sm text-slate-600">En produccion, este flujo debe llamar Supabase Auth para enviar magic link/reset password al admin.</p></SettingsCard><SettingsCard title="Negocios"><div className="space-y-2">{businesses.map((business) => <div key={business.id} className="grid gap-3 rounded-md border border-line p-3 md:grid-cols-[1fr_110px_140px_auto_auto] md:items-center"><div><p className="font-bold">{business.name}</p><p className="text-sm text-slate-600">{business.email} · {business.phone || "Sin telefono"}</p></div><span className={`rounded-md px-3 py-2 text-sm font-bold ${business.demo ? "bg-yellow-100 text-yellow-900" : "bg-sky-100 text-sky-900"}`}>{business.demo ? "Demo" : "Real"}</span><button className={`rounded-md px-3 py-2 font-bold ${business.status === "active" ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-700"}`} onClick={() => setBusinesses((current) => current.map((item) => item.id === business.id ? { ...item, status: item.status === "active" ? "inactive" : "active" } : item))}>{business.status === "active" ? "Activo" : "Inactivo"}</button><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => setDetailId(business.id)}>Detalle</button><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => onSupport(business.id)}>Soporte</button></div>)}</div></SettingsCard>{detail && <SettingsCard title="Detalle del negocio"><div className="grid gap-2 text-sm md:grid-cols-2"><SummaryRow label="Nombre" value={detail.name} /><SummaryRow label="Tipo" value={detail.demo ? "Demo" : "Real"} /><SummaryRow label="Estado" value={detail.status} /><SummaryRow label="Usuarios" value={String(users.filter((user) => user.businessId === detail.id).length)} /><SummaryRow label="Invitaciones" value={String(invitations.filter((invite) => invite.businessId === detail.id).length)} /></div></SettingsCard>}</>}{tab === "invitations" && <SettingsCard title="Invitaciones"><div className="space-y-2">{invitations.length === 0 && <p className="rounded-md bg-surface p-3 text-sm">Sin invitaciones.</p>}{invitations.map((invite) => <div key={invite.id} className="grid gap-2 rounded-md bg-surface p-3 text-sm md:grid-cols-[1fr_120px_auto]"><span>{invite.email} · {invite.role} · {businesses.find((business) => business.id === invite.businessId)?.name}</span><strong>{invite.status}</strong><button className="rounded-md border border-line bg-white px-3 py-2 font-bold" onClick={() => setInvitations((current) => current.map((item) => item.id === invite.id ? { ...item, status: "pending", createdAt: now() } : item))}>Reenviar</button></div>)}</div></SettingsCard>}{tab === "checklist" && <AccessChecklist />}</section></main>;
+}
+
+function SuperAdminPanelV2({ businesses, setBusinesses, users, setUsers, invitations, setInvitations, orders, onSupport, onLogout }: { businesses: Business[]; setBusinesses: React.Dispatch<React.SetStateAction<Business[]>>; users: BusinessUser[]; setUsers: React.Dispatch<React.SetStateAction<BusinessUser[]>>; invitations: Invitation[]; setInvitations: React.Dispatch<React.SetStateAction<Invitation[]>>; orders: Order[]; onSupport: (businessId: string) => void; onLogout: () => void }) {
+  const [tab, setTab] = useState<SuperAdminTab>("businesses");
+  const [draft, setDraft] = useState({ name: "", email: "", phone: "", kind: "real" as "real" | "demo" });
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const [filter, setFilter] = useState<BusinessFilter>("all");
+  const [search, setSearch] = useState("");
+  const [deleteText, setDeleteText] = useState("");
+
+  function createBusiness() {
+    if (!draft.name.trim() || !draft.email.trim()) return;
+    const businessId = createId("business");
+    const business: Business = { ...initialBusiness, id: businessId, name: draft.name.trim(), commercialName: draft.name.trim(), phone: draft.phone, email: draft.email.trim(), status: "active", testMode: true, demo: draft.kind === "demo", onboardingCompleted: false, onboardingSkipped: false, createdAt: now() };
+    const adminUser: BusinessUser = { id: createId("user"), businessId, email: draft.email.trim(), name: draft.email.trim(), role: "admin", status: "active", permissions: superAdminPermissions, createdAt: now() };
+    const invite: Invitation = { id: createId("invite"), businessId, email: draft.email.trim(), role: "admin", permissions: superAdminPermissions, status: "pending", invitedBy: "super_admin", createdAt: now() };
+    setBusinesses((current) => [business, ...current]);
+    setUsers((current) => [adminUser, ...current]);
+    setInvitations((current) => [invite, ...current]);
+    setDraft({ name: "", email: "", phone: "", kind: "real" });
+  }
+
+  const updateBusiness = (businessId: string, patch: Partial<Business>) => {
+    setBusinesses((current) => current.map((item) => item.id === businessId ? { ...item, ...patch } : item));
+    if (supabase) {
+      const dbPatch: Record<string, unknown> = {};
+      if (patch.name !== undefined) dbPatch.name = patch.name;
+      if (patch.commercialName !== undefined) dbPatch.commercial_name = patch.commercialName;
+      if (patch.phone !== undefined) dbPatch.phone = patch.phone;
+      if (patch.status !== undefined) dbPatch.status = patch.status;
+      if (Object.keys(dbPatch).length) void supabase.from("businesses").update(dbPatch).eq("id", businessId);
+    }
+  };
+  const toggleBusiness = (business: Business) => updateBusiness(business.id, { status: business.status === "active" ? "inactive" : "active" });
+  const detail = businesses.find((business) => business.id === detailId);
+  const detailUsers = detail ? users.filter((user) => user.businessId === detail.id) : [];
+  const detailInvitations = detail ? invitations.filter((invite) => invite.businessId === detail.id) : [];
+  const detailOrders = detail ? orders.filter((order) => order.businessId === detail.id) : [];
+  const detailPaidOrders = detailOrders.filter((order) => order.status === "pagada");
+  const detailTotal = detailPaidOrders.reduce((sum, order) => sum + order.total, 0);
+  const detailLastActivity = [...detailOrders.map((order) => order.closedAt ?? order.createdAt), ...(detail?.lastActivityAt ? [detail.lastActivityAt] : [])].sort().at(-1);
+  const statusClass = (status: Business["status"]) => status === "active" ? "bg-emerald-100 text-emerald-800" : status === "deleted" ? "bg-red-100 text-red-800" : "bg-slate-200 text-slate-700";
+  const visibleBusinesses = businesses.filter((business) => {
+    const admin = users.find((user) => user.businessId === business.id && user.role === "admin");
+    const text = `${business.name} ${business.email} ${admin?.email ?? ""}`.toLowerCase();
+    const matchesSearch = text.includes(search.toLowerCase());
+    const matchesFilter = filter === "all" ? business.status !== "deleted" : filter === "real" ? !business.demo && business.status !== "deleted" : filter === "demo" ? business.demo && business.status !== "deleted" : filter === "active" ? business.status === "active" : filter === "inactive" ? business.status === "inactive" : business.status === "deleted";
+    return matchesSearch && matchesFilter;
+  });
+
+  return <main className="min-h-screen bg-surface"><header className="border-b border-line bg-white"><div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-4"><div><p className="text-sm font-bold text-brand">Super Admin</p><h1 className="text-2xl font-black">Panel del sistema</h1></div><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={onLogout}>Salir</button></div></header><section className="mx-auto max-w-7xl space-y-4 px-4 py-5"><InnerTabs current={tab} onChange={setTab} tabs={[{ id: "businesses", label: "Negocios" }, { id: "invitations", label: "Invitaciones" }, { id: "checklist", label: "Checklist" }]} />{tab === "businesses" && <><SettingsCard title="Crear negocio"><div className="grid gap-3 md:grid-cols-[1fr_1fr_180px_160px_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Nombre del negocio" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" placeholder="Correo admin" value={draft.email} onChange={(event) => setDraft({ ...draft, email: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" placeholder="Telefono" value={draft.phone} onChange={(event) => setDraft({ ...draft, phone: event.target.value })} /><select className="min-h-11 rounded-md border border-line px-3" value={draft.kind} onChange={(event) => setDraft({ ...draft, kind: event.target.value as "real" | "demo" })}><option value="real">Real</option><option value="demo">Demo</option></select><button className="rounded-md bg-brand px-4 font-bold text-white" onClick={createBusiness}>Crear</button></div><p className="mt-2 text-sm text-slate-600">En produccion, este flujo debe llamar Supabase Auth para enviar magic link/reset password al admin.</p></SettingsCard><SettingsCard title="Negocios"><div className="grid gap-3 lg:grid-cols-[1fr_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Buscar por negocio o correo admin" value={search} onChange={(event) => setSearch(event.target.value)} /><div className="flex gap-2 overflow-x-auto">{(["all", "real", "demo", "active", "inactive", "deleted"] as BusinessFilter[]).map((item) => <button key={item} className={`min-h-11 shrink-0 rounded-md border px-3 font-bold ${filter === item ? "border-brand bg-brand text-white" : "border-line bg-white"}`} onClick={() => setFilter(item)}>{item === "all" ? "Todos" : item === "real" ? "Reales" : item === "demo" ? "Demo" : item === "active" ? "Activos" : item === "inactive" ? "Inactivos" : "Eliminados"}</button>)}</div></div><div className="mt-4 grid gap-3 lg:grid-cols-2">{visibleBusinesses.map((business) => { const admin = users.find((user) => user.businessId === business.id && user.role === "admin"); return <article key={business.id} className="rounded-md border border-line bg-white p-4 shadow-soft"><div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="text-xl font-black">{business.name}</h2><p className="text-sm text-slate-600">{business.email || admin?.email || "Sin correo"} · {business.phone || "Sin telefono"}</p><p className="mt-1 text-sm text-slate-600">Admin: {admin?.email ?? "Pendiente"}</p></div><div className="flex gap-2"><span className={`rounded-md px-3 py-2 text-sm font-bold ${business.demo ? "bg-yellow-100 text-yellow-900" : "bg-sky-100 text-sky-900"}`}>{business.demo ? "Demo" : "Real"}</span><span className={`rounded-md px-3 py-2 text-sm font-bold ${statusClass(business.status)}`}>{business.status}</span></div></div><div className="mt-4 flex flex-wrap gap-2"><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => { setDetailId(business.id); setDeleteText(""); }}>Detalle</button><button disabled={business.status === "deleted"} className="rounded-md bg-brand px-3 py-2 font-bold text-white disabled:opacity-40" onClick={() => onSupport(business.id)}>Soporte</button><button disabled={business.status === "deleted"} className="rounded-md border border-line px-3 py-2 font-bold disabled:opacity-40" onClick={() => toggleBusiness(business)}>{business.status === "active" ? "Desactivar" : "Activar"}</button></div></article>; })}{visibleBusinesses.length === 0 && <p className="rounded-md bg-surface p-3 text-sm text-slate-600">No hay negocios con esos filtros.</p>}</div></SettingsCard>{detail && <SettingsCard title="Detalle del negocio"><div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="text-2xl font-black">{detail.name}</h2><p className="text-sm text-slate-600">{detail.demo ? "Demo" : "Real"} · {detail.status}</p></div><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => setDetailId(null)}>Cerrar detalle</button></div><div className="mt-4 grid gap-3 md:grid-cols-2"><TextField label="Nombre" value={detail.name} onChange={(value) => updateBusiness(detail.id, { name: value, commercialName: value })} /><TextField label="Telefono" value={detail.phone} onChange={(value) => updateBusiness(detail.id, { phone: value })} /><SummaryRow label="Correo" value={detail.email || "-"} /><SummaryRow label="Estado" value={detail.status} /><SummaryRow label="Tipo" value={detail.demo ? "Demo" : "Real"} /><SummaryRow label="Creado" value={detail.createdAt ? formatDateTime(detail.createdAt) : "-"} /><SummaryRow label="Total ordenes" value={String(detailOrders.length)} /><SummaryRow label="Total vendido" value={money.format(detailTotal)} /><SummaryRow label="Ultima actividad" value={detailLastActivity ? formatDateTime(detailLastActivity) : "-"} /><SummaryRow label="Admin asignado" value={detailUsers.find((user) => user.role === "admin")?.email ?? "Pendiente"} /></div><div className="mt-4 flex flex-wrap gap-2"><button disabled={detail.status === "deleted"} className="rounded-md border border-line px-3 py-2 font-bold disabled:opacity-40" onClick={() => toggleBusiness(detail)}>{detail.status === "active" ? "Desactivar negocio" : "Activar negocio"}</button><button disabled={detail.status === "deleted"} className="rounded-md bg-brand px-3 py-2 font-bold text-white disabled:opacity-40" onClick={() => onSupport(detail.id)}>Entrar en soporte</button><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => setInvitations((current) => current.map((invite) => invite.businessId === detail.id && invite.role === "admin" ? { ...invite, status: "pending", createdAt: now() } : invite))}>Reenviar invitacion admin</button></div><div className="mt-5 grid gap-4 lg:grid-cols-2"><div><h3 className="font-black">Usuarios y cajeros</h3><div className="mt-2 space-y-2">{detailUsers.map((user) => <div key={user.id} className="grid gap-2 rounded-md bg-surface p-3 text-sm md:grid-cols-[1fr_100px_auto] md:items-center"><span>{user.name} · {user.email}</span><strong>{user.role}</strong><button className="rounded-md border border-line bg-white px-3 py-2 font-bold" onClick={() => setUsers((current) => current.map((item) => item.id === user.id ? { ...item, status: item.status === "active" ? "inactive" : "active" } : item))}>{user.status === "active" ? "Desactivar" : "Activar"}</button></div>)}{detailUsers.length === 0 && <p className="rounded-md bg-surface p-3 text-sm">Sin usuarios.</p>}</div></div><div><h3 className="font-black">Invitaciones</h3><div className="mt-2 space-y-2">{detailInvitations.map((invite) => <div key={invite.id} className="rounded-md bg-surface p-3 text-sm">{invite.email} · {invite.role} · <strong>{invite.status}</strong></div>)}{detailInvitations.length === 0 && <p className="rounded-md bg-surface p-3 text-sm">Sin invitaciones.</p>}</div></div></div><div className="mt-5 rounded-md border border-red-200 bg-red-50 p-4"><h3 className="font-black text-red-900">Eliminar negocio</h3><p className="mt-1 text-sm text-red-800">Soft delete: se marcara como eliminado y se ocultara del listado principal. No se borran datos fisicos.</p><div className="mt-3 grid gap-2 sm:grid-cols-[1fr_auto]"><input className="min-h-11 rounded-md border border-red-200 px-3" placeholder="Escribe ELIMINAR para confirmar" value={deleteText} onChange={(event) => setDeleteText(event.target.value)} /><button disabled={deleteText !== "ELIMINAR"} className="rounded-md bg-red-700 px-4 font-bold text-white disabled:opacity-40" onClick={() => { updateBusiness(detail.id, { status: "deleted" }); setDetailId(null); setDeleteText(""); }}>Eliminar negocio</button></div></div></SettingsCard>}</>}{tab === "invitations" && <SettingsCard title="Invitaciones"><div className="space-y-2">{invitations.length === 0 && <p className="rounded-md bg-surface p-3 text-sm">Sin invitaciones.</p>}{invitations.map((invite) => <div key={invite.id} className="grid gap-2 rounded-md bg-surface p-3 text-sm md:grid-cols-[1fr_120px_auto]"><span>{invite.email} · {invite.role} · {businesses.find((business) => business.id === invite.businessId)?.name}</span><strong>{invite.status}</strong><button className="rounded-md border border-line bg-white px-3 py-2 font-bold" onClick={() => setInvitations((current) => current.map((item) => item.id === invite.id ? { ...item, status: "pending", createdAt: now() } : item))}>Reenviar</button></div>)}</div></SettingsCard>}{tab === "checklist" && <AccessChecklist />}</section></main>;
 }
 
 function InnerTabs<T extends string>({ tabs, current, onChange }: { tabs: { id: T; label: string; icon?: ReactNode }[]; current: T; onChange: (tab: T) => void }) {

@@ -6,7 +6,7 @@ on conflict (id) do nothing;
 
 create type app_role as enum ('super_admin', 'admin', 'cajero');
 create type user_status as enum ('active', 'inactive');
-create type business_status as enum ('active', 'inactive');
+create type business_status as enum ('active', 'inactive', 'deleted');
 create type invitation_status as enum ('pending', 'accepted', 'expired');
 create type table_status as enum ('libre', 'ocupada', 'esperando_pago');
 create type order_type as enum ('mesa', 'pickup', 'delivery');

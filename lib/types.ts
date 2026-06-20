@@ -1,5 +1,5 @@
 export type Role = "super_admin" | "admin" | "cajero";
-export type BusinessStatus = "active" | "inactive";
+export type BusinessStatus = "active" | "inactive" | "deleted";
 export type UserStatus = "active" | "inactive";
 export type InvitationStatus = "pending" | "accepted" | "expired";
 export type TableStatus = "libre" | "ocupada" | "esperando_pago";
@@ -106,6 +106,8 @@ export type Business = {
   onboardingSkipped: boolean;
   currency: string;
   timezone: string;
+  createdAt?: string;
+  lastActivityAt?: string;
 };
 
 export type ReceiptSettings = {
