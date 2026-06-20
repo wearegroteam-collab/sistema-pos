@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import type { ReactNode } from "react";
+import type { FormEvent, ReactNode } from "react";
 import {
   ArrowDown,
   ArrowUp,
@@ -90,7 +90,7 @@ const initialBusiness: Business = {
   status: "active",
   testMode: true,
   demo: true,
-  onboardingCompleted: false,
+  onboardingCompleted: true,
   onboardingSkipped: false,
   currency: "COP",
   timezone: "America/Bogota"
@@ -157,11 +157,7 @@ const defaultCashierPermissions: CashierPermissions = {
   modifySettings: false
 };
 
-const initialBusinessUsers: BusinessUser[] = [
-  { id: "user-super", businessId: "system", email: "super@pos.com", name: "Super Admin", role: "super_admin", status: "active", permissions: superAdminPermissions, createdAt: now() },
-  { id: "user-admin", businessId: "business-demo", email: "admin@demo.com", name: "Admin Demo", role: "admin", status: "active", permissions: superAdminPermissions, createdAt: now() },
-  { id: "user-cashier", businessId: "business-demo", email: "cajero@demo.com", name: "Cajero Demo", role: "cajero", status: "active", permissions: defaultCashierPermissions, createdAt: now() }
-];
+const initialBusinessUsers: BusinessUser[] = [];
 
 const initialSettings: AppSettings = {
   receipt: {
@@ -296,12 +292,13 @@ function normalizeSettings(settings?: Partial<AppSettings>): AppSettings {
 }
 
 function normalizeBusiness(business: Partial<Business>): Business {
+  const isDemo = business.demo ?? business.id === initialBusiness.id;
   return {
     ...initialBusiness,
     ...business,
     currency: "COP",
     timezone: "America/Bogota",
-    onboardingCompleted: business.onboardingCompleted ?? false,
+    onboardingCompleted: business.onboardingCompleted ?? isDemo,
     onboardingSkipped: business.onboardingSkipped ?? false
   };
 }
@@ -331,6 +328,65 @@ function getShiftSummary(shift: CashShift, orders: Order[]) {
   };
 }
 
+function normalizeRole(role?: string | null): Role | null {
+  if (role === "super_admin" || role === "admin" || role === "cajero") return role;
+  if (role === "cashier") return "cajero";
+  return null;
+}
+
+function normalizePermissions(role: Role, permissions?: Partial<CashierPermissions> | null): CashierPermissions {
+  if (role === "super_admin" || role === "admin") return superAdminPermissions;
+  return { ...defaultCashierPermissions, ...(permissions ?? {}) };
+}
+
+function mapBusinessRow(row: Record<string, unknown>): Business {
+  return normalizeBusiness({
+    id: String(row.id),
+    name: String(row.name ?? "Negocio"),
+    commercialName: String(row.commercial_name ?? row.name ?? "Negocio"),
+    logoUrl: row.logo_url ? String(row.logo_url) : undefined,
+    address: String(row.address ?? ""),
+    phone: String(row.phone ?? ""),
+    email: String(row.email ?? ""),
+    nit: row.nit ? String(row.nit) : "",
+    status: row.status === "inactive" ? "inactive" : "active",
+    testMode: Boolean(row.test_mode),
+    demo: Boolean(row.demo),
+    onboardingCompleted: Boolean(row.onboarding_completed),
+    onboardingSkipped: Boolean(row.onboarding_skipped)
+  });
+}
+
+function mapBusinessUserRow(row: Record<string, unknown>, fallbackEmail: string): BusinessUser | null {
+  const role = normalizeRole(String(row.role ?? ""));
+  if (!role) return null;
+  return {
+    id: String(row.id),
+    businessId: row.business_id ? String(row.business_id) : "system",
+    email: String(row.email ?? fallbackEmail).toLowerCase(),
+    name: String(row.full_name ?? row.email ?? fallbackEmail),
+    role,
+    status: row.status === "inactive" ? "inactive" : "active",
+    permissions: normalizePermissions(role, row.permissions as Partial<CashierPermissions> | null),
+    createdAt: String(row.created_at ?? now())
+  };
+}
+
+function mapInvitationRow(row: Record<string, unknown>): Invitation | null {
+  const role = normalizeRole(String(row.role ?? ""));
+  if (!role || !row.business_id) return null;
+  return {
+    id: String(row.id),
+    businessId: String(row.business_id),
+    email: String(row.email ?? "").toLowerCase(),
+    role,
+    permissions: normalizePermissions(role, row.permissions as Partial<CashierPermissions> | null),
+    status: row.status === "accepted" || row.status === "expired" ? row.status : "pending",
+    invitedBy: row.invited_by ? String(row.invited_by) : "",
+    createdAt: String(row.created_at ?? now())
+  };
+}
+
 export function PosApp() {
   const initialPath = typeof window === "undefined" ? "/" : window.location.pathname;
   const [businesses, setBusinesses] = useState<Business[]>([initialBusiness]);
@@ -350,9 +406,10 @@ export function PosApp() {
   const [showCloseShift, setShowCloseShift] = useState(false);
   const [tab, setTab] = useState<MainTab>(initialPath.includes("reports") ? "reportes" : initialPath.includes("orders") ? "ordenes" : initialPath.includes("settings") || initialPath.includes("admin") ? "ajustes" : "mesas");
   const [role, setRole] = useState<Role>("admin");
-  const [session, setSession] = useState<{ email: string } | null>(null);
-  const [login, setLogin] = useState({ email: "admin@demo.com", password: "demo123", role: "admin" as Role });
+  const [session, setSession] = useState<{ email: string; userId?: string } | null>(null);
+  const [login, setLogin] = useState({ email: "", password: "" });
   const [loginError, setLoginError] = useState("");
+  const [authLoading, setAuthLoading] = useState(true);
 
   const currentUser = session?.email ?? "Usuario";
   const isSuperAdminRoute = initialPath.startsWith("/super-admin");
@@ -377,6 +434,33 @@ export function PosApp() {
     setOrders(normalizeOrders(parsed.orders ?? []));
     setSettings(normalizeSettings(parsed.settings));
     setShifts(parsed.shifts ?? []);
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    async function restoreSession() {
+      if (!supabase) {
+        if (mounted) setAuthLoading(false);
+        return;
+      }
+      const { data } = await supabase.auth.getSession();
+      if (data.session?.user) {
+        await loadAuthenticatedUser(data.session.user, { redirect: initialPath === "/" });
+      } else if (mounted) {
+        setAuthLoading(false);
+      }
+    }
+    restoreSession();
+    const { data } = supabase?.auth.onAuthStateChange((_event, nextSession) => {
+      if (!nextSession?.user) {
+        setSession(null);
+        setAuthLoading(false);
+      }
+    }) ?? { data: { subscription: null } };
+    return () => {
+      mounted = false;
+      data.subscription?.unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
@@ -510,6 +594,141 @@ export function PosApp() {
     setActiveOrderId(null);
   }
 
+  async function loadAuthenticatedUser(authUser: { id: string; email?: string | null }, options: { redirect: boolean }) {
+    if (!supabase) {
+      setLoginError("Supabase Auth no esta configurado.");
+      setAuthLoading(false);
+      return false;
+    }
+    const email = (authUser.email ?? "").toLowerCase();
+    setAuthLoading(true);
+    const { data: rows, error } = await supabase
+      .from("business_users")
+      .select("id,business_id,email,full_name,role,status,permissions,created_at")
+      .eq("user_id", authUser.id)
+      .eq("status", "active");
+
+    if (error || !rows?.length) {
+      await supabase.auth.signOut();
+      setSession(null);
+      setLoginError("No tienes un usuario activo asignado a un negocio.");
+      setAuthLoading(false);
+      return false;
+    }
+
+    const mappedUsers = rows
+      .map((row) => mapBusinessUserRow(row as Record<string, unknown>, email))
+      .filter((user): user is BusinessUser => Boolean(user));
+    const selectedUser = mappedUsers.find((user) => user.role === "super_admin")
+      ?? mappedUsers.find((user) => user.role === "admin")
+      ?? mappedUsers[0];
+
+    if (!selectedUser) {
+      await supabase.auth.signOut();
+      setLoginError("Tu rol no esta configurado correctamente.");
+      setAuthLoading(false);
+      return false;
+    }
+
+    setBusinessUsers((current) => {
+      const remaining = current.filter((user) => !mappedUsers.some((mapped) => mapped.id === user.id));
+      return [...mappedUsers, ...remaining];
+    });
+    setRole(selectedUser.role);
+    setSession({ email: selectedUser.email, userId: authUser.id });
+
+    if (selectedUser.role === "super_admin") {
+      const { data: businessRows } = await supabase
+        .from("businesses")
+        .select("id,name,commercial_name,logo_url,address,phone,email,nit,status,test_mode,demo,onboarding_completed,onboarding_skipped,currency,timezone")
+        .order("created_at", { ascending: false });
+      if (businessRows) setBusinesses(businessRows.map((row) => mapBusinessRow(row as Record<string, unknown>)));
+
+      const { data: userRows } = await supabase
+        .from("business_users")
+        .select("id,business_id,email,full_name,role,status,permissions,created_at")
+        .order("created_at", { ascending: false });
+      if (userRows) {
+        const users = userRows
+          .map((row) => mapBusinessUserRow(row as Record<string, unknown>, email))
+          .filter((user): user is BusinessUser => Boolean(user));
+        setBusinessUsers(users);
+      }
+
+      const { data: invitationRows } = await supabase
+        .from("invitations")
+        .select("id,business_id,email,role,status,permissions,invited_by,created_at")
+        .order("created_at", { ascending: false });
+      if (invitationRows) {
+        setInvitations(invitationRows.map((row) => mapInvitationRow(row as Record<string, unknown>)).filter((invite): invite is Invitation => Boolean(invite)));
+      }
+    } else {
+      setActiveBusinessId(selectedUser.businessId);
+      const { data: businessRow } = await supabase
+        .from("businesses")
+        .select("id,name,commercial_name,logo_url,address,phone,email,nit,status,test_mode,demo,onboarding_completed,onboarding_skipped,currency,timezone")
+        .eq("id", selectedUser.businessId)
+        .maybeSingle();
+      if (businessRow) {
+        const mappedBusiness = mapBusinessRow(businessRow as Record<string, unknown>);
+        setBusinesses((current) => [mappedBusiness, ...current.filter((item) => item.id !== mappedBusiness.id)]);
+      }
+      const { data: businessUserRows } = await supabase
+        .from("business_users")
+        .select("id,business_id,email,full_name,role,status,permissions,created_at")
+        .eq("business_id", selectedUser.businessId)
+        .order("created_at", { ascending: false });
+      if (businessUserRows) {
+        const users = businessUserRows
+          .map((row) => mapBusinessUserRow(row as Record<string, unknown>, email))
+          .filter((user): user is BusinessUser => Boolean(user));
+        setBusinessUsers(users);
+      }
+      setInvitations((current) => current.map((invite) => invite.businessId === selectedUser.businessId && invite.email === selectedUser.email && invite.role === selectedUser.role ? { ...invite, status: "accepted" } : invite));
+    }
+
+    setLoginError("");
+    setAuthLoading(false);
+
+    if (options.redirect && typeof window !== "undefined") {
+      if (selectedUser.role === "super_admin") window.location.assign("/super-admin");
+      else if (!initialPath.startsWith("/super-admin")) window.location.assign(selectedUser.role === "cajero" ? "/pos/mesas" : "/pos");
+    }
+    return true;
+  }
+
+  async function handleLogin(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!supabase) {
+      setLoginError("Supabase Auth no esta configurado.");
+      return;
+    }
+    setLoginError("");
+    setAuthLoading(true);
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: login.email.trim().toLowerCase(),
+      password: login.password
+    });
+    if (error || !data.user) {
+      setLoginError("Email o contrasena incorrectos.");
+      setAuthLoading(false);
+      return;
+    }
+    await loadAuthenticatedUser(data.user, { redirect: true });
+  }
+
+  async function handleLogout() {
+    if (supabase) await supabase.auth.signOut();
+    setSession(null);
+    setRole("admin");
+    setActiveBusinessId(initialBusiness.id);
+    setLogin({ email: "", password: "" });
+  }
+
+  if (authLoading && !session) {
+    return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-xl font-black">Cargando acceso...</h1></section></main>;
+  }
+
   if (!session) {
     return (
       <main className="grid min-h-screen place-items-center bg-surface px-4">
@@ -518,19 +737,30 @@ export function PosApp() {
             <div className="grid size-12 place-items-center rounded-md bg-brand text-white"><Utensils size={24} /></div>
             <div><p className="text-sm font-bold text-brand">Sistema POS</p><h1 className="text-2xl font-black">Entrar al punto de venta</h1></div>
           </div>
-          <div className="mt-6 space-y-3">
+          <form className="mt-6 space-y-3" onSubmit={handleLogin}>
             <input className="min-h-12 w-full rounded-md border border-line px-3" type="email" placeholder="Email" value={login.email} onChange={(event) => setLogin({ ...login, email: event.target.value })} />
             <input className="min-h-12 w-full rounded-md border border-line px-3" type="password" placeholder="Contrasena" value={login.password} onChange={(event) => setLogin({ ...login, password: event.target.value })} />
-            {isSuperAdminRoute ? <input className="min-h-12 w-full rounded-md border border-line px-3" value="Super Admin" readOnly /> : <select className="min-h-12 w-full rounded-md border border-line px-3" value={login.role === "super_admin" ? "admin" : login.role} onChange={(event) => setLogin({ ...login, role: event.target.value as Role })}><option value="admin">Admin</option><option value="cajero">Cajero</option></select>}
             {loginError && <p className="rounded-md bg-red-50 p-3 text-sm font-bold text-red-800">{loginError}</p>}
-            <button className="flex min-h-12 w-full items-center justify-center gap-2 rounded-md bg-brand px-4 font-bold text-white" onClick={() => { const nextRole: Role = isSuperAdminRoute ? "super_admin" : login.role === "super_admin" ? "admin" : login.role; const user = businessUsers.find((item) => item.email === login.email && item.role === nextRole && item.status === "active"); if (!user) { setLoginError("No tienes permiso para acceder con ese rol."); return; } setLoginError(""); setRole(nextRole); if (user.businessId && user.businessId !== "system") setActiveBusinessId(user.businessId); setSession({ email: login.email }); }}>
-              <LogIn size={20} /> Iniciar sesion
+            <button disabled={authLoading || !login.email.trim() || !login.password} className="flex min-h-12 w-full items-center justify-center gap-2 rounded-md bg-brand px-4 font-bold text-white disabled:opacity-50">
+              <LogIn size={20} /> {authLoading ? "Validando..." : "Iniciar sesion"}
             </button>
-          </div>
-          <p className="mt-4 text-sm text-slate-600">{hasSupabaseConfig ? "Listo para conectar con Supabase Auth." : "Demo local: usa cualquier email y contrasena."}</p>
+          </form>
+          {!hasSupabaseConfig && <p className="mt-4 rounded-md bg-red-50 p-3 text-sm font-bold text-red-800">Supabase Auth no esta configurado.</p>}
         </section>
       </main>
     );
+  }
+
+  if (isSuperAdminRoute && role !== "super_admin") {
+    return <main className="grid min-h-screen place-items-center bg-surface p-4"><NoPermission /></main>;
+  }
+
+  if (role === "super_admin") {
+    if (!isSuperAdminRoute && typeof window !== "undefined") {
+      window.location.replace("/super-admin");
+      return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-xl font-black">Redirigiendo...</h1></section></main>;
+    }
+    return <SuperAdminPanel businesses={businesses} setBusinesses={setBusinesses} users={businessUsers} setUsers={setBusinessUsers} invitations={invitations} setInvitations={setInvitations} onSupport={(businessId) => { setActiveBusinessId(businessId); setRole("admin"); }} onLogout={handleLogout} />;
   }
 
   if (!activeShift && !currentBusiness.testMode && (currentBusiness.onboardingCompleted || currentBusiness.onboardingSkipped)) {
@@ -542,7 +772,7 @@ export function PosApp() {
               <p className="text-sm font-semibold text-brand">POS MVP</p>
               <h1 className="text-2xl font-black">{currentBusiness.name}</h1>
             </div>
-            <button className="rounded-md border border-line bg-white px-3 py-2 font-semibold" onClick={() => setSession(null)}>Salir</button>
+            <button className="rounded-md border border-line bg-white px-3 py-2 font-semibold" onClick={handleLogout}>Salir</button>
           </div>
         </header>
         <section className="mx-auto max-w-xl px-4 py-8">
@@ -553,23 +783,15 @@ export function PosApp() {
     );
   }
 
-  if (isSuperAdminRoute && role !== "super_admin") {
-    return <main className="grid min-h-screen place-items-center bg-surface p-4"><NoPermission /></main>;
-  }
-
-  if (role === "super_admin") {
-    return <SuperAdminPanel businesses={businesses} setBusinesses={setBusinesses} users={businessUsers} setUsers={setBusinessUsers} invitations={invitations} setInvitations={setInvitations} onSupport={(businessId) => { setActiveBusinessId(businessId); setRole("admin"); }} onLogout={() => setSession(null)} />;
-  }
-
   if (currentBusiness.status === "inactive") {
-    return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="max-w-md rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-2xl font-black">Negocio inactivo</h1><p className="mt-2 text-slate-600">Este negocio esta desactivado. Contacta al administrador del sistema.</p><button className="mt-4 rounded-md border border-line px-4 py-2 font-bold" onClick={() => setSession(null)}>Salir</button></section></main>;
+    return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="max-w-md rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-2xl font-black">Negocio inactivo</h1><p className="mt-2 text-slate-600">Este negocio esta desactivado. Contacta al administrador del sistema.</p><button className="mt-4 rounded-md border border-line px-4 py-2 font-bold" onClick={handleLogout}>Salir</button></section></main>;
   }
 
   if (!currentBusiness.onboardingCompleted && !currentBusiness.onboardingSkipped) {
     if (role !== "admin") {
-      return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="max-w-md rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-2xl font-black">Configuracion pendiente</h1><p className="mt-2 text-slate-600">El admin debe completar o saltar el onboarding antes de operar el POS.</p><button className="mt-4 rounded-md border border-line px-4 py-2 font-bold" onClick={() => setSession(null)}>Salir</button></section></main>;
+      return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="max-w-md rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-2xl font-black">Configuracion pendiente</h1><p className="mt-2 text-slate-600">El admin debe completar o saltar el onboarding antes de operar el POS.</p><button className="mt-4 rounded-md border border-line px-4 py-2 font-bold" onClick={handleLogout}>Salir</button></section></main>;
     }
-    return <OnboardingWizard business={currentBusiness} setBusiness={(updater) => setBusinesses((current) => current.map((item) => item.id === activeBusinessId ? (typeof updater === "function" ? updater(item) : updater) : item))} settings={settings} setSettings={setSettings} categories={businessCategories} setCategories={setCategories} products={businessProducts} setProducts={setProducts} tables={businessTables} setTables={setTables} activeBusinessId={activeBusinessId} onLogout={() => setSession(null)} />;
+    return <OnboardingWizard business={currentBusiness} setBusiness={(updater) => setBusinesses((current) => current.map((item) => item.id === activeBusinessId ? (typeof updater === "function" ? updater(item) : updater) : item))} settings={settings} setSettings={setSettings} categories={businessCategories} setCategories={setCategories} products={businessProducts} setProducts={setProducts} tables={businessTables} setTables={setTables} activeBusinessId={activeBusinessId} onLogout={handleLogout} />;
   }
 
   return (
@@ -588,7 +810,7 @@ export function PosApp() {
             {role === "admin" && <button className="rounded-md border border-line bg-white px-3 py-2 font-semibold" onClick={() => { setOrders((current) => current.filter((order) => !(order.businessId === activeBusinessId && order.testMode))); setShifts((current) => current.filter((shift) => !(shift.businessId === activeBusinessId && shift.testMode))); }}>Limpiar prueba</button>}
             <span className="rounded-md border border-line bg-surface px-3 py-2 text-sm">{session.email}</span>
             <span className="rounded-md border border-line bg-surface px-3 py-2 text-sm">{hasSupabaseConfig ? "Supabase configurado" : "Modo local"}</span>
-            <button className="rounded-md border border-line bg-white px-3 py-2 font-semibold" onClick={() => setSession(null)}>Salir</button>
+            <button className="rounded-md border border-line bg-white px-3 py-2 font-semibold" onClick={handleLogout}>Salir</button>
           </div>
         </div>
       </header>
@@ -772,7 +994,7 @@ function SuperAdminPanel({ businesses, setBusinesses, users, setUsers, invitatio
   function createBusiness() {
     if (!draft.name.trim() || !draft.email.trim()) return;
     const businessId = createId("business");
-    const business: Business = { ...initialBusiness, id: businessId, name: draft.name.trim(), commercialName: draft.name.trim(), phone: draft.phone, email: draft.email, status: "active", testMode: draft.kind === "demo", demo: draft.kind === "demo" };
+    const business: Business = { ...initialBusiness, id: businessId, name: draft.name.trim(), commercialName: draft.name.trim(), phone: draft.phone, email: draft.email, status: "active", testMode: true, demo: draft.kind === "demo", onboardingCompleted: false, onboardingSkipped: false };
     const adminUser: BusinessUser = { id: createId("user"), businessId, email: draft.email.trim(), name: draft.email.trim(), role: "admin", status: "active", permissions: superAdminPermissions, createdAt: now() };
     const invite: Invitation = { id: createId("invite"), businessId, email: draft.email.trim(), role: "admin", permissions: superAdminPermissions, status: "pending", invitedBy: "super_admin", createdAt: now() };
     setBusinesses((current) => [business, ...current]);
