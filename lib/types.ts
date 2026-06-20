@@ -102,6 +102,8 @@ export type Business = {
   status: BusinessStatus;
   testMode: boolean;
   demo: boolean;
+  onboardingCompleted: boolean;
+  onboardingSkipped: boolean;
   currency: string;
   timezone: string;
 };

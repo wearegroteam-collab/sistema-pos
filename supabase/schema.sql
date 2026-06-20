@@ -25,6 +25,8 @@ create table businesses (
   status business_status not null default 'active',
   test_mode boolean not null default true,
   demo boolean not null default false,
+  onboarding_completed boolean not null default false,
+  onboarding_skipped boolean not null default false,
   currency text not null default 'COP',
   timezone text not null default 'America/Bogota',
   created_at timestamptz not null default now()

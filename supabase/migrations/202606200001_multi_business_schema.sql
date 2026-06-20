@@ -40,6 +40,8 @@ create table if not exists public.businesses (
   status public.record_status not null default 'active',
   demo boolean not null default false,
   test_mode boolean not null default true,
+  onboarding_completed boolean not null default false,
+  onboarding_skipped boolean not null default false,
   currency text not null default 'COP' check (currency = 'COP'),
   timezone text not null default 'America/Bogota' check (timezone = 'America/Bogota'),
   created_at timestamptz not null default now(),

@@ -90,6 +90,8 @@ const initialBusiness: Business = {
   status: "active",
   testMode: true,
   demo: true,
+  onboardingCompleted: false,
+  onboardingSkipped: false,
   currency: "COP",
   timezone: "America/Bogota"
 };
@@ -293,6 +295,17 @@ function normalizeSettings(settings?: Partial<AppSettings>): AppSettings {
   };
 }
 
+function normalizeBusiness(business: Partial<Business>): Business {
+  return {
+    ...initialBusiness,
+    ...business,
+    currency: "COP",
+    timezone: "America/Bogota",
+    onboardingCompleted: business.onboardingCompleted ?? false,
+    onboardingSkipped: business.onboardingSkipped ?? false
+  };
+}
+
 function methodBucket(method?: PaymentMethod) {
   if (method === "efectivo") return "cash";
   if (method === "tarjeta") return "card";
@@ -346,14 +359,14 @@ export function PosApp() {
   const currentBusinessUser = businessUsers.find((user) => user.email === currentUser && (role === "super_admin" || user.businessId === activeBusinessId));
   const can = (permission: keyof CashierPermissions) => role === "super_admin" || role === "admin" || Boolean(currentBusinessUser?.permissions[permission] ?? settings.cashierPermissions[permission]);
   const activeShift = shifts.find((shift) => shift.businessId === activeBusinessId && shift.status === "abierto" && !shift.testMode) ?? null;
-  const currentBusiness = businesses.find((item) => item.id === activeBusinessId) ?? business;
+  const currentBusiness = normalizeBusiness(businesses.find((item) => item.id === activeBusinessId) ?? business);
 
   useEffect(() => {
     const saved = window.localStorage.getItem("simple-pos-state");
     if (!saved) return;
     const parsed = JSON.parse(saved);
-    setBusinesses(parsed.businesses ?? [parsed.business ? { ...initialBusiness, ...parsed.business } : initialBusiness]);
-    setBusiness({ ...initialBusiness, ...parsed.business });
+    setBusinesses((parsed.businesses ?? [parsed.business ? { ...initialBusiness, ...parsed.business } : initialBusiness]).map((item: Partial<Business>) => normalizeBusiness(item)));
+    setBusiness(normalizeBusiness(parsed.business ?? initialBusiness));
     setBusinessUsers(parsed.businessUsers ?? initialBusinessUsers);
     setInvitations(parsed.invitations ?? []);
     setActiveBusinessId(parsed.activeBusinessId ?? initialBusiness.id);
@@ -520,7 +533,7 @@ export function PosApp() {
     );
   }
 
-  if (!activeShift && !currentBusiness.testMode) {
+  if (!activeShift && !currentBusiness.testMode && (currentBusiness.onboardingCompleted || currentBusiness.onboardingSkipped)) {
     return (
       <main className="min-h-screen bg-surface">
         <header className="border-b border-line bg-white">
@@ -550,6 +563,13 @@ export function PosApp() {
 
   if (currentBusiness.status === "inactive") {
     return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="max-w-md rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-2xl font-black">Negocio inactivo</h1><p className="mt-2 text-slate-600">Este negocio esta desactivado. Contacta al administrador del sistema.</p><button className="mt-4 rounded-md border border-line px-4 py-2 font-bold" onClick={() => setSession(null)}>Salir</button></section></main>;
+  }
+
+  if (!currentBusiness.onboardingCompleted && !currentBusiness.onboardingSkipped) {
+    if (role !== "admin") {
+      return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="max-w-md rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-2xl font-black">Configuracion pendiente</h1><p className="mt-2 text-slate-600">El admin debe completar o saltar el onboarding antes de operar el POS.</p><button className="mt-4 rounded-md border border-line px-4 py-2 font-bold" onClick={() => setSession(null)}>Salir</button></section></main>;
+    }
+    return <OnboardingWizard business={currentBusiness} setBusiness={(updater) => setBusinesses((current) => current.map((item) => item.id === activeBusinessId ? (typeof updater === "function" ? updater(item) : updater) : item))} settings={settings} setSettings={setSettings} categories={businessCategories} setCategories={setCategories} products={businessProducts} setProducts={setProducts} tables={businessTables} setTables={setTables} activeBusinessId={activeBusinessId} onLogout={() => setSession(null)} />;
   }
 
   return (
@@ -625,6 +645,123 @@ function TabButton({ icon, label, tab, current, onClick, disabled }: { icon: Rea
     <button disabled={disabled} className={`flex min-h-11 shrink-0 items-center gap-2 rounded-md border px-4 py-2 font-semibold disabled:opacity-40 ${active ? "border-brand bg-brand text-white" : "border-line bg-white text-ink"}`} onClick={() => onClick(tab)}>
       {icon}{label}
     </button>
+  );
+}
+
+function OnboardingWizard({
+  business,
+  setBusiness,
+  settings,
+  setSettings,
+  categories,
+  setCategories,
+  products,
+  setProducts,
+  tables,
+  setTables,
+  activeBusinessId,
+  onLogout
+}: {
+  business: Business;
+  setBusiness: React.Dispatch<React.SetStateAction<Business>>;
+  settings: AppSettings;
+  setSettings: React.Dispatch<React.SetStateAction<AppSettings>>;
+  categories: Category[];
+  setCategories: React.Dispatch<React.SetStateAction<Category[]>>;
+  products: Product[];
+  setProducts: React.Dispatch<React.SetStateAction<Product[]>>;
+  tables: RestaurantTable[];
+  setTables: React.Dispatch<React.SetStateAction<RestaurantTable[]>>;
+  activeBusinessId: string;
+  onLogout: () => void;
+}) {
+  const steps = ["Datos", "Logo", "Propina", "Categorias", "Productos", "Mesas", "Finalizar"];
+  const [step, setStep] = useState(0);
+  const [categoryName, setCategoryName] = useState("");
+  const [productDraft, setProductDraft] = useState({ name: "", price: "", categoryId: categories[0]?.id ?? "", description: "" });
+  const [tableName, setTableName] = useState("");
+  const progress = Math.round(((step + 1) / steps.length) * 100);
+
+  async function uploadLogo(file?: File) {
+    if (!file) return;
+    if (supabase) {
+      const path = `logos/${Date.now()}-${file.name}`;
+      const { error } = await supabase.storage.from("business-logos").upload(path, file, { upsert: true });
+      if (!error) {
+        const { data } = supabase.storage.from("business-logos").getPublicUrl(path);
+        setBusiness((current) => ({ ...current, logoUrl: data.publicUrl }));
+        return;
+      }
+    }
+    const reader = new FileReader();
+    reader.onload = () => setBusiness((current) => ({ ...current, logoUrl: String(reader.result) }));
+    reader.readAsDataURL(file);
+  }
+
+  function finish(skipped = false) {
+    setBusiness((current) => ({ ...current, onboardingCompleted: !skipped, onboardingSkipped: skipped }));
+  }
+
+  function addCategory() {
+    if (!categoryName.trim()) return;
+    const category = { id: createId("cat"), businessId: activeBusinessId, name: categoryName.trim() };
+    setCategories((current) => [...current, category]);
+    setCategoryName("");
+    if (!productDraft.categoryId) setProductDraft((current) => ({ ...current, categoryId: category.id }));
+  }
+
+  function addProduct() {
+    if (!productDraft.name.trim()) return;
+    const categoryId = productDraft.categoryId || categories[0]?.id || "";
+    if (!categoryId) return;
+    setProducts((current) => [...current, { id: createId("prod"), businessId: activeBusinessId, categoryId, name: productDraft.name.trim(), price: Number(productDraft.price) || 0, description: productDraft.description.trim(), active: true }]);
+    setProductDraft({ name: "", price: "", categoryId, description: "" });
+  }
+
+  function addTable() {
+    if (!tableName.trim()) return;
+    setTables((current) => [...current, { id: createId("table"), businessId: activeBusinessId, name: tableName.trim(), status: "libre", sortOrder: current.filter((table) => table.businessId === activeBusinessId).length + 1 }]);
+    setTableName("");
+  }
+
+  return (
+    <main className="min-h-screen bg-surface">
+      <header className="border-b border-line bg-white">
+        <div className="mx-auto flex max-w-5xl items-center justify-between px-4 py-4">
+          <div>
+            <p className="text-sm font-bold text-brand">Configuracion inicial</p>
+            <h1 className="text-2xl font-black">{business.name}</h1>
+          </div>
+          <button className="rounded-md border border-line px-3 py-2 font-bold" onClick={onLogout}>Salir</button>
+        </div>
+      </header>
+      <section className="mx-auto max-w-5xl space-y-4 px-4 py-6">
+        <div className="rounded-md border border-line bg-white p-4 shadow-soft">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <strong>Paso {step + 1} de {steps.length}: {steps[step]}</strong>
+            <button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => finish(true)}>Saltar onboarding</button>
+          </div>
+          <div className="mt-3 h-3 overflow-hidden rounded-full bg-surface">
+            <div className="h-full bg-brand transition-all" style={{ width: `${progress}%` }} />
+          </div>
+        </div>
+
+        <section className="rounded-md border border-line bg-white p-5 shadow-soft">
+          {step === 0 && <div className="grid gap-3 md:grid-cols-2"><TextField label="Nombre del negocio" value={business.name} onChange={(value) => setBusiness((current) => ({ ...current, name: value, commercialName: value }))} /><TextField label="NIT opcional" value={business.nit ?? ""} onChange={(value) => setBusiness((current) => ({ ...current, nit: value }))} /><TextField label="Direccion" value={business.address} onChange={(value) => setBusiness((current) => ({ ...current, address: value }))} /><TextField label="Telefono" value={business.phone} onChange={(value) => setBusiness((current) => ({ ...current, phone: value }))} /><TextField label="Email" value={business.email} onChange={(value) => setBusiness((current) => ({ ...current, email: value }))} /><div className="rounded-md bg-surface p-3 text-sm font-bold">COP · America/Bogota</div></div>}
+          {step === 1 && <div className="space-y-4"><div className="flex flex-wrap items-center gap-3">{business.logoUrl && <img src={business.logoUrl} alt="Logo" className="size-24 rounded-md border border-line object-cover" />}<label className="min-h-11 cursor-pointer rounded-md border border-line bg-white px-4 py-3 font-bold">Subir logo<input className="hidden" type="file" accept="image/*" onChange={(event) => uploadLogo(event.target.files?.[0])} /></label>{business.logoUrl && <button className="min-h-11 rounded-md border border-line px-4 font-bold" onClick={() => setBusiness((current) => ({ ...current, logoUrl: undefined }))}>Quitar logo</button>}</div><p className="text-sm text-slate-600">El logo puede mostrarse en header y recibos.</p></div>}
+          {step === 2 && <div className="grid gap-3 md:grid-cols-2"><Toggle label="Propina activa" checked={settings.checkout.tipEnabled} onChange={(value) => setSettings((current) => ({ ...current, checkout: { ...current.checkout, tipEnabled: value, tipMode: value ? current.checkout.tipMode : "none" }, receipt: { ...current.receipt, showTip: value } }))} /><label className="space-y-1"><span className="text-sm font-bold">Modo de propina</span><select className="min-h-11 w-full rounded-md border border-line px-3" value={settings.checkout.tipMode} onChange={(event) => setSettings((current) => ({ ...current, checkout: { ...current.checkout, tipMode: event.target.value as AppSettings["checkout"]["tipMode"] } }))}><option value="manual">Manual</option><option value="suggested">Sugeridas: 5%, 10%, 15%</option><option value="none">Sin propina</option></select></label></div>}
+          {step === 3 && <div className="space-y-4"><div className="grid gap-3 sm:grid-cols-[1fr_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Nueva categoria" value={categoryName} onChange={(event) => setCategoryName(event.target.value)} /><button className="rounded-md bg-brand px-4 font-bold text-white" onClick={addCategory}>Agregar</button></div><div className="grid gap-2 md:grid-cols-2">{categories.map((category) => <div key={category.id} className="rounded-md bg-surface p-3 font-semibold">{category.name}</div>)}</div></div>}
+          {step === 4 && <div className="space-y-4"><div className="grid gap-3 md:grid-cols-[1fr_140px_180px_1fr_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Producto" value={productDraft.name} onChange={(event) => setProductDraft({ ...productDraft, name: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" placeholder="Precio" type="number" value={productDraft.price} onChange={(event) => setProductDraft({ ...productDraft, price: event.target.value })} /><select className="min-h-11 rounded-md border border-line px-3" value={productDraft.categoryId || categories[0]?.id || ""} onChange={(event) => setProductDraft({ ...productDraft, categoryId: event.target.value })}>{categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select><input className="min-h-11 rounded-md border border-line px-3" placeholder="Descripcion" value={productDraft.description} onChange={(event) => setProductDraft({ ...productDraft, description: event.target.value })} /><button className="rounded-md bg-brand px-4 font-bold text-white" onClick={addProduct}>Agregar</button></div><div className="grid gap-2 md:grid-cols-2">{products.map((product) => <div key={product.id} className="rounded-md bg-surface p-3 font-semibold">{product.name} · {money.format(product.price)}</div>)}</div></div>}
+          {step === 5 && <div className="space-y-4"><div className="grid gap-3 sm:grid-cols-[1fr_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Mesa 1, Barra, Terraza..." value={tableName} onChange={(event) => setTableName(event.target.value)} /><button className="rounded-md bg-brand px-4 font-bold text-white" onClick={addTable}>Agregar</button></div><div className="grid gap-2 md:grid-cols-3">{tables.map((table) => <div key={table.id} className="rounded-md bg-surface p-3 font-semibold">{table.name}</div>)}</div></div>}
+          {step === 6 && <div className="space-y-3"><h2 className="text-xl font-black">Todo listo para operar</h2><p className="text-slate-600">Puedes terminar la configuracion inicial y entrar al POS. Luego podras ajustar menu, mesas, recibo, comanda e impresion desde Ajustes.</p><div className="grid gap-2 md:grid-cols-3"><Metric title="Categorias" value={String(categories.length)} /><Metric title="Productos" value={String(products.length)} /><Metric title="Mesas" value={String(tables.length)} /></div></div>}
+        </section>
+
+        <div className="flex flex-wrap justify-between gap-3">
+          <button disabled={step === 0} className="min-h-11 rounded-md border border-line bg-white px-4 font-bold disabled:opacity-40" onClick={() => setStep((current) => Math.max(0, current - 1))}>Anterior</button>
+          {step < steps.length - 1 ? <button className="min-h-11 rounded-md bg-brand px-4 font-bold text-white" onClick={() => setStep((current) => Math.min(steps.length - 1, current + 1))}>Continuar</button> : <button className="min-h-11 rounded-md bg-ink px-4 font-bold text-white" onClick={() => finish(false)}>Finalizar configuracion</button>}
+        </div>
+      </section>
+    </main>
   );
 }
 
