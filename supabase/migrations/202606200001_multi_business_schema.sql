@@ -14,7 +14,7 @@ do $$ begin
 exception when duplicate_object then null; end $$;
 
 do $$ begin
-  create type public.table_status as enum ('libre', 'ocupada', 'esperando_pago');
+  create type public.table_status as enum ('libre', 'ocupada', 'esperando_pago', 'bloqueada');
 exception when duplicate_object then null; end $$;
 
 do $$ begin
@@ -139,6 +139,12 @@ create table if not exists public.restaurant_tables (
   name text not null,
   status public.table_status not null default 'libre',
   sort_order integer not null default 0,
+  x numeric(10, 2) not null default 40,
+  y numeric(10, 2) not null default 40,
+  width numeric(10, 2) not null default 110,
+  height numeric(10, 2) not null default 90,
+  shape text not null default 'rectangle' check (shape in ('square', 'rectangle', 'circle')),
+  zone text not null default 'Salon',
   active boolean not null default true,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()

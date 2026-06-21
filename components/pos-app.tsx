@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
+import type { FormEvent, MouseEvent, ReactNode } from "react";
 import {
   ArrowDown,
   ArrowUp,
@@ -48,6 +48,7 @@ import type {
   ReceiptSettings,
   RestaurantTable,
   Role,
+  TableStatus,
   Invitation
 } from "@/lib/types";
 import { hasSupabaseConfig, supabase } from "@/lib/supabase";
@@ -118,10 +119,10 @@ const initialAdditions: Addition[] = [
 ];
 
 const initialTables: RestaurantTable[] = [
-  { id: "table-1", businessId: "business-demo", name: "Mesa 1", status: "libre", sortOrder: 1 },
-  { id: "table-2", businessId: "business-demo", name: "Mesa 2", status: "libre", sortOrder: 2 },
-  { id: "table-3", businessId: "business-demo", name: "Barra", status: "libre", sortOrder: 3 },
-  { id: "table-4", businessId: "business-demo", name: "Terraza", status: "libre", sortOrder: 4 }
+  { id: "table-1", businessId: "business-demo", name: "Mesa 1", status: "libre", sortOrder: 1, x: 40, y: 40, width: 120, height: 90, shape: "rectangle", zone: "Salon" },
+  { id: "table-2", businessId: "business-demo", name: "Mesa 2", status: "libre", sortOrder: 2, x: 210, y: 40, width: 92, height: 92, shape: "circle", zone: "Salon" },
+  { id: "table-3", businessId: "business-demo", name: "Barra", status: "libre", sortOrder: 3, x: 40, y: 190, width: 230, height: 70, shape: "rectangle", zone: "Barra" },
+  { id: "table-4", businessId: "business-demo", name: "Terraza", status: "libre", sortOrder: 4, x: 340, y: 150, width: 110, height: 110, shape: "square", zone: "Terraza" }
 ];
 
 const superAdminPermissions: CashierPermissions = {
@@ -170,15 +171,22 @@ const initialSettings: AppSettings = {
     footerMessage: "Gracias por tu compra",
     socialText: "@mirestaurante",
     showTip: true,
+    showCashier: true,
+    showOrderSource: true,
+    showItemNotes: true,
     size: "80mm"
   },
   kitchen: {
     showBusinessName: true,
+    showLogo: false,
     showTime: true,
     showOrderNumber: true,
     showOrderSource: true,
+    showCashier: false,
     groupByCategory: false,
     highlightNotes: true,
+    showAdditions: true,
+    internalMessage: "",
     size: "80mm"
   },
   printing: {
@@ -276,6 +284,19 @@ function normalizeOrders(orders: Order[]) {
     cashier: order.cashier ?? "Sistema",
     audit: order.audit ?? [],
     items: order.items.map((item) => ({ ...item, additions: item.additions ?? [] }))
+  }));
+}
+
+function normalizeTables(tables: RestaurantTable[]) {
+  return tables.map((table, index) => ({
+    ...table,
+    sortOrder: table.sortOrder ?? index + 1,
+    x: table.x ?? 40 + (index % 4) * 140,
+    y: table.y ?? 40 + Math.floor(index / 4) * 130,
+    width: table.width ?? 110,
+    height: table.height ?? 90,
+    shape: table.shape ?? "rectangle",
+    zone: table.zone ?? "Salon"
   }));
 }
 
@@ -449,7 +470,7 @@ export function PosApp() {
     setCategories(parsed.categories ?? initialCategories);
     setProducts(parsed.products ?? initialProducts);
     setAdditions(parsed.additions ?? initialAdditions);
-    setTables((parsed.tables ?? initialTables).map((table: RestaurantTable, index: number) => ({ ...table, sortOrder: table.sortOrder ?? index + 1 })));
+    setTables(normalizeTables(parsed.tables ?? initialTables));
     setOrders(normalizeOrders(parsed.orders ?? []));
     setSettings(normalizeSettings(parsed.settings));
     setShifts(parsed.shifts ?? []);
@@ -485,6 +506,24 @@ export function PosApp() {
   useEffect(() => {
     window.localStorage.setItem("simple-pos-state", JSON.stringify({ businesses, business, businessUsers, invitations, activeBusinessId, categories, products, additions, tables, orders, settings, shifts }));
   }, [businesses, business, businessUsers, invitations, activeBusinessId, business, categories, products, additions, tables, orders, settings, shifts]);
+
+  useEffect(() => {
+    if (!supabase || !session || role === "super_admin" || activeBusinessId === "system") return;
+    const client = supabase;
+    const timer = window.setTimeout(() => {
+      void client.from("settings").upsert({
+        business_id: activeBusinessId,
+        receipt_settings: settings.receipt,
+        kitchen_settings: settings.kitchen,
+        kitchen_ticket_settings: settings.kitchen,
+        printing_settings: settings.printing,
+        checkout_settings: settings.checkout,
+        payment_methods: settings.paymentMethods,
+        cashier_permissions: settings.cashierPermissions
+      }, { onConflict: "business_id" });
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [settings, activeBusinessId, session, role]);
 
   const businessCategories = categories.filter((item) => (item.businessId ?? activeBusinessId) === activeBusinessId);
   const businessProducts = products.filter((item) => (item.businessId ?? activeBusinessId) === activeBusinessId);
@@ -531,6 +570,8 @@ export function PosApp() {
 
   function openOrderForTable(table: RestaurantTable) {
     if (!can("createOrders")) return;
+    if (table.status === "bloqueada") return;
+    if (!activeShift && !currentBusiness.testMode) return;
     const existing = orders.find((order) => order.tableId === table.id && !["pagada", "cancelada", "anulada"].includes(order.status));
     if (existing) return setActiveOrderId(existing.id);
     const order = makeOrder("mesa", table);
@@ -541,6 +582,7 @@ export function PosApp() {
 
   function createDirectOrder(type: Exclude<OrderType, "mesa">) {
     if (!can("createOrders")) return;
+    if (!activeShift && !currentBusiness.testMode) return;
     const order = makeOrder(type);
     setOrders((current) => [order, ...current]);
     setActiveOrderId(order.id);
@@ -554,6 +596,7 @@ export function PosApp() {
 
   function confirmKitchen(order: Order) {
     if (!can("confirmKitchen")) return;
+    if (!activeShift && !currentBusiness.testMode) return;
     updateOrder(order.id, (current) => ({ ...current, status: "en_cocina", audit: [...current.audit, audit(currentUser, "Orden confirmada y comanda generada")] }));
     if (order.tableId) setTables((current) => current.map((table) => (table.id === order.tableId ? { ...table, status: "esperando_pago" } : table)));
     setPrintMode("comanda");
@@ -804,26 +847,6 @@ export function PosApp() {
     return <SuperAdminPanelV3 businesses={businesses} setBusinesses={setBusinesses} users={businessUsers} setUsers={setBusinessUsers} invitations={invitations} setInvitations={setInvitations} orders={orders} onSupport={enterSupportMode} onLogout={handleLogout} />;
   }
 
-  if (!isSupportMode && !activeShift && !currentBusiness.testMode && (currentBusiness.onboardingCompleted || currentBusiness.onboardingSkipped)) {
-    return (
-      <main className="min-h-screen bg-surface">
-        <header className="border-b border-line bg-white">
-          <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-4">
-            <div>
-              <p className="text-sm font-semibold text-brand">POS MVP</p>
-              <h1 className="text-2xl font-black">{currentBusiness.name}</h1>
-            </div>
-            <button className="rounded-md border border-line bg-white px-3 py-2 font-semibold" onClick={handleLogout}>Salir</button>
-          </div>
-        </header>
-        <section className="mx-auto max-w-xl px-4 py-8">
-          {can("openShift") ? <OpenShiftPanel cashier={currentUser} onOpen={openShift} /> : <NoPermission />}
-          <ShiftHistory shifts={shifts} orders={orders} compact />
-        </section>
-      </main>
-    );
-  }
-
   if (!isSupportMode && currentBusiness.status === "inactive") {
     return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="max-w-md rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-2xl font-black">Negocio inactivo</h1><p className="mt-2 text-slate-600">Este negocio esta desactivado. Contacta al administrador del sistema.</p><button className="mt-4 rounded-md border border-line px-4 py-2 font-bold" onClick={handleLogout}>Salir</button></section></main>;
   }
@@ -873,7 +896,7 @@ export function PosApp() {
       </div>
 
       <section className="mx-auto max-w-7xl px-4 py-5">
-        {tab === "mesas" && (can("viewTables") ? <TablesView role={role} tables={orderedTables} setTables={setTables} activeBusinessId={activeBusinessId} openOrderForTable={openOrderForTable} createDirectOrder={createDirectOrder} /> : <NoPermission />)}
+        {tab === "mesas" && (can("viewTables") ? <TablesView role={role} tables={orderedTables} setTables={setTables} activeBusinessId={activeBusinessId} activeShift={activeShift} testMode={currentBusiness.testMode} canOpenShift={can("openShift")} openShift={openShift} openOrderForTable={openOrderForTable} createDirectOrder={createDirectOrder} /> : <NoPermission />)}
         {tab === "menu" && (can("modifyMenu") ? <MenuManager canEdit={can("modifyMenu")} activeBusinessId={activeBusinessId} categories={businessCategories} setCategories={setCategories} products={businessProducts} setProducts={setProducts} additions={businessAdditions} setAdditions={setAdditions} /> : <NoPermission />)}
         {tab === "ordenes" && (can("viewOrders") ? <OrdersHistory orders={businessOrders} setActiveOrderId={setActiveOrderId} setPrintMode={setPrintMode} /> : <NoPermission />)}
         {tab === "reportes" && (can("viewReports") ? <ReportsView orders={businessOrders.filter((order) => order.status === "pagada")} shifts={shifts.filter((shift) => (shift.businessId ?? activeBusinessId) === activeBusinessId)} /> : <NoPermission />)}
@@ -1220,47 +1243,92 @@ function InnerTabs<T extends string>({ tabs, current, onChange }: { tabs: { id: 
   );
 }
 
-function TablesView({ role, tables, setTables, activeBusinessId, openOrderForTable, createDirectOrder }: { role: Role; tables: RestaurantTable[]; setTables: React.Dispatch<React.SetStateAction<RestaurantTable[]>>; activeBusinessId: string; openOrderForTable: (table: RestaurantTable) => void; createDirectOrder: (type: Exclude<OrderType, "mesa">) => void }) {
+function TablesView({ role, tables, setTables, activeBusinessId, activeShift, testMode, canOpenShift, openShift, openOrderForTable, createDirectOrder }: { role: Role; tables: RestaurantTable[]; setTables: React.Dispatch<React.SetStateAction<RestaurantTable[]>>; activeBusinessId: string; activeShift: CashShift | null; testMode: boolean; canOpenShift: boolean; openShift: (openingAmount: number, openingNote?: string) => void; openOrderForTable: (table: RestaurantTable) => void; createDirectOrder: (type: Exclude<OrderType, "mesa">) => void }) {
   const [configMode, setConfigMode] = useState(false);
   const [name, setName] = useState("");
+  const [showOpenShift, setShowOpenShift] = useState(false);
+  const [dragging, setDragging] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
   const canEdit = role === "admin";
-  const moveTable = (id: string, direction: -1 | 1) => setTables((current) => {
-    const sorted = [...current].sort((a, b) => a.sortOrder - b.sortOrder);
-    const index = sorted.findIndex((table) => table.id === id);
-    const target = index + direction;
-    if (target < 0 || target >= sorted.length) return current;
-    [sorted[index], sorted[target]] = [sorted[target], sorted[index]];
-    return sorted.map((table, order) => ({ ...table, sortOrder: order + 1 }));
-  });
+  const canSell = Boolean(activeShift) || testMode;
+  const zones = ["Salon", "Terraza", "Barra", "Patio"];
+  const updateTable = (id: string, patch: Partial<RestaurantTable>) => setTables((current) => current.map((table) => table.id === id ? { ...table, ...patch } : table));
+  const tryOpenTable = (table: RestaurantTable) => {
+    if (!canSell) return setShowOpenShift(true);
+    openOrderForTable(table);
+  };
+  const tryCreateOrder = (type: Exclude<OrderType, "mesa">) => {
+    if (!canSell) return setShowOpenShift(true);
+    createDirectOrder(type);
+  };
+  const startDrag = (event: MouseEvent<HTMLDivElement>, table: RestaurantTable) => {
+    if (!configMode) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    setDragging({ id: table.id, offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top });
+  };
+  const dragTable = (event: MouseEvent<HTMLDivElement>) => {
+    if (!dragging) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    updateTable(dragging.id, { x: Math.max(0, event.clientX - rect.left - dragging.offsetX), y: Math.max(0, event.clientY - rect.top - dragging.offsetY) });
+  };
+  const statusClass = (status: TableStatus) => status === "libre" ? "bg-emerald-100 text-emerald-800 border-emerald-300" : status === "ocupada" ? "bg-orange-100 text-orange-800 border-orange-300" : status === "esperando_pago" ? "bg-sky-100 text-sky-800 border-sky-300" : "bg-slate-200 text-slate-600 border-slate-300";
   return (
     <div className="space-y-5">
       <div className="flex flex-col gap-3 rounded-md border border-line bg-white p-4 shadow-soft lg:flex-row lg:items-end lg:justify-between">
         <div><h1 className="text-2xl font-bold">Mapa de mesas</h1><p className="mt-1 text-sm text-slate-600">Operacion diaria desde mesas, pickup o delivery.</p></div>
         <div className="flex flex-wrap gap-2">
-          <button className="flex min-h-12 items-center gap-2 rounded-md bg-accent px-4 py-2 font-bold text-white" onClick={() => createDirectOrder("pickup")}><ShoppingBag size={20} /> Pickup</button>
-          <button className="flex min-h-12 items-center gap-2 rounded-md bg-ink px-4 py-2 font-bold text-white" onClick={() => createDirectOrder("delivery")}><PackagePlus size={20} /> Delivery</button>
+          <button className="flex min-h-12 items-center gap-2 rounded-md bg-accent px-4 py-2 font-bold text-white" onClick={() => tryCreateOrder("pickup")}><ShoppingBag size={20} /> Pickup</button>
+          <button className="flex min-h-12 items-center gap-2 rounded-md bg-ink px-4 py-2 font-bold text-white" onClick={() => tryCreateOrder("delivery")}><PackagePlus size={20} /> Delivery</button>
           <button disabled={!canEdit} className="flex min-h-12 items-center gap-2 rounded-md border border-line bg-white px-4 py-2 font-bold disabled:opacity-40" onClick={() => setConfigMode((value) => !value)}><Settings size={20} /> {configMode ? "Cerrar config." : "Configurar mapa"}</button>
         </div>
       </div>
+      {!canSell && <div className="rounded-md border border-yellow-200 bg-yellow-50 p-4 text-yellow-900"><div className="flex flex-wrap items-center justify-between gap-3"><p className="font-bold">No hay turno abierto. Abre turno para comenzar a vender.</p><button disabled={!canOpenShift} className="rounded-md bg-ink px-4 py-2 font-bold text-white disabled:opacity-40" onClick={() => setShowOpenShift(true)}>Abrir turno</button></div></div>}
+      {showOpenShift && <div className="rounded-md border border-line bg-white p-4 shadow-soft"><OpenShiftPanel cashier="Caja" onOpen={(amount, note) => { openShift(amount, note); setShowOpenShift(false); }} /></div>}
       {configMode && (
         <div className="grid gap-3 rounded-md border border-line bg-white p-4 shadow-soft sm:grid-cols-[1fr_auto]">
           <input className="min-h-12 rounded-md border border-line px-3" placeholder="Nombre o numero de mesa" value={name} onChange={(event) => setName(event.target.value)} />
-          <button className="flex min-h-12 items-center justify-center gap-2 rounded-md bg-brand px-4 font-bold text-white" onClick={() => { if (!name.trim()) return; setTables((current) => [...current, { id: createId("table"), businessId: activeBusinessId, name: name.trim(), status: "libre", sortOrder: current.length + 1 }]); setName(""); }}><Plus size={20} /> Crear mesa</button>
+          <button className="flex min-h-12 items-center justify-center gap-2 rounded-md bg-brand px-4 font-bold text-white" onClick={() => { if (!name.trim()) return; setTables((current) => [...current, { id: createId("table"), businessId: activeBusinessId, name: name.trim(), status: "libre", sortOrder: current.length + 1, x: 60, y: 60, width: 110, height: 90, shape: "rectangle", zone: "Salon" }]); setName(""); }}><Plus size={20} /> Crear mesa</button>
         </div>
       )}
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="hidden overflow-auto rounded-md border border-line bg-white p-4 shadow-soft md:block">
+        <div className="relative h-[560px] min-w-[760px] rounded-md bg-surface" onMouseMove={dragTable} onMouseUp={() => setDragging(null)} onMouseLeave={() => setDragging(null)}>
+          {tables.map((table) => {
+            const shape = table.shape ?? "rectangle";
+            return <div key={table.id} className={`absolute border-2 p-2 shadow-soft ${configMode ? "cursor-move" : ""} ${statusClass(table.status)} ${shape === "circle" ? "rounded-full" : "rounded-md"}`} style={{ left: table.x ?? 40, top: table.y ?? 40, width: table.width ?? 110, height: table.height ?? 90 }} onMouseDown={(event) => startDrag(event, table)}>
+              <button className="flex h-full w-full flex-col items-center justify-center text-center" onClick={() => !configMode && tryOpenTable(table)}>
+                {configMode ? <input className="w-full rounded-md border border-line bg-white px-2 py-1 text-center font-black" value={table.name} onChange={(event) => updateTable(table.id, { name: event.target.value })} /> : <strong>{table.name}</strong>}
+                <span className="mt-1 text-xs font-bold">{table.zone ?? "Salon"}</span>
+              </button>
+              {configMode && <div className="absolute left-0 top-full z-10 mt-2 grid w-64 gap-2 rounded-md border border-line bg-white p-2 text-xs shadow-soft">
+                <div className="grid grid-cols-4 gap-1">
+                  <input className="rounded border px-1 py-1" type="number" value={table.x ?? 0} onChange={(event) => updateTable(table.id, { x: Number(event.target.value) || 0 })} />
+                  <input className="rounded border px-1 py-1" type="number" value={table.y ?? 0} onChange={(event) => updateTable(table.id, { y: Number(event.target.value) || 0 })} />
+                  <input className="rounded border px-1 py-1" type="number" value={table.width ?? 110} onChange={(event) => updateTable(table.id, { width: Math.max(60, Number(event.target.value) || 60) })} />
+                  <input className="rounded border px-1 py-1" type="number" value={table.height ?? 90} onChange={(event) => updateTable(table.id, { height: Math.max(50, Number(event.target.value) || 50) })} />
+                </div>
+                <div className="grid grid-cols-3 gap-1">
+                  <select className="rounded border px-1 py-1" value={table.shape ?? "rectangle"} onChange={(event) => updateTable(table.id, { shape: event.target.value as RestaurantTable["shape"] })}><option value="square">Cuadrada</option><option value="rectangle">Rectangular</option><option value="circle">Redonda</option></select>
+                  <select className="rounded border px-1 py-1" value={table.zone ?? "Salon"} onChange={(event) => updateTable(table.id, { zone: event.target.value })}>{zones.map((zone) => <option key={zone} value={zone}>{zone}</option>)}</select>
+                  <select className="rounded border px-1 py-1" value={table.status} onChange={(event) => updateTable(table.id, { status: event.target.value as TableStatus })}><option value="libre">Libre</option><option value="ocupada">Ocupada</option><option value="esperando_pago">Esperando pago</option><option value="bloqueada">Bloqueada</option></select>
+                </div>
+                <button className="rounded-md border border-red-200 bg-red-50 px-2 py-1 font-bold text-red-800" onClick={() => setTables((current) => current.filter((item) => item.id !== table.id))}>Eliminar</button>
+              </div>}
+            </div>;
+          })}
+        </div>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2 lg:hidden">
         {tables.map((table) => (
           <article key={table.id} className="rounded-md border border-line bg-white p-4 shadow-soft">
-            <button className="w-full text-left" onClick={() => !configMode && openOrderForTable(table)}>
+            <button className="w-full text-left" onClick={() => !configMode && tryOpenTable(table)}>
               <div className="flex items-start justify-between gap-3">
                 {configMode ? <input className="w-full rounded-md border border-line bg-surface px-2 py-2 text-xl font-bold outline-none" value={table.name} onChange={(event) => setTables((current) => current.map((item) => item.id === table.id ? { ...item, name: event.target.value } : item))} /> : <h2 className="text-xl font-bold">{table.name}</h2>}
-                <span className={`rounded-md px-2 py-1 text-xs font-bold ${table.status === "libre" ? "bg-emerald-100 text-emerald-800" : table.status === "ocupada" ? "bg-orange-100 text-orange-800" : "bg-sky-100 text-sky-800"}`}>{table.status.replace("_", " ")}</span>
+                <span className={`rounded-md border px-2 py-1 text-xs font-bold ${statusClass(table.status)}`}>{table.status.replace("_", " ")}</span>
               </div>
               <p className="mt-8 text-sm font-semibold text-slate-600">{configMode ? "Editando mapa" : "Tocar para abrir orden"}</p>
             </button>
             {configMode && <div className="mt-3 flex gap-2">
-              <IconButton title="Mover arriba" onClick={() => moveTable(table.id, -1)}><ArrowUp size={18} /></IconButton>
-              <IconButton title="Mover abajo" onClick={() => moveTable(table.id, 1)}><ArrowDown size={18} /></IconButton>
+              <IconButton title="Mover izquierda" onClick={() => updateTable(table.id, { x: (table.x ?? 0) - 20 })}><ArrowUp size={18} /></IconButton>
+              <IconButton title="Mover derecha" onClick={() => updateTable(table.id, { x: (table.x ?? 0) + 20 })}><ArrowDown size={18} /></IconButton>
               <IconButton title="Eliminar mesa" onClick={() => setTables((current) => current.filter((item) => item.id !== table.id).map((item, index) => ({ ...item, sortOrder: index + 1 })))}><Trash2 size={18} /></IconButton>
             </div>}
           </article>
@@ -1569,6 +1637,9 @@ function ReceiptSettingsView({ business, setBusiness, settings, setSettings }: {
   return <SettingsCard title="Recibo"><div className="grid gap-5 lg:grid-cols-[1fr_360px]"><div className="grid gap-3 md:grid-cols-2">
     <Toggle label="Mostrar logo" checked={settings.showLogo} onChange={(value) => setSettings({ ...settings, showLogo: value })} />
     <Toggle label="Mostrar propina" checked={settings.showTip} onChange={(value) => setSettings({ ...settings, showTip: value })} />
+    <Toggle label="Mostrar cajero" checked={settings.showCashier} onChange={(value) => setSettings({ ...settings, showCashier: value })} />
+    <Toggle label="Mostrar mesa/tipo" checked={settings.showOrderSource} onChange={(value) => setSettings({ ...settings, showOrderSource: value })} />
+    <Toggle label="Mostrar notas de productos" checked={settings.showItemNotes} onChange={(value) => setSettings({ ...settings, showItemNotes: value })} />
     <label className="min-h-11 cursor-pointer rounded-md border border-line bg-white px-4 py-3 font-bold">Subir/reemplazar logo<input className="hidden" type="file" accept="image/*" onChange={(event) => uploadLogo(event.target.files?.[0])} /></label>
     {business.logoUrl && <button className="min-h-11 rounded-md border border-line bg-white px-4 font-bold" onClick={() => setBusiness((current) => ({ ...current, logoUrl: undefined }))}>Quitar logo</button>}
     <TextField label="Nombre comercial" value={settings.businessName} onChange={(value) => setSettings({ ...settings, businessName: value })} />
@@ -1584,8 +1655,10 @@ function ReceiptSettingsView({ business, setBusiness, settings, setSettings }: {
 
 function KitchenSettingsView({ settings, setSettings }: { settings: KitchenSettings; setSettings: (settings: KitchenSettings) => void }) {
   return <SettingsCard title="Comanda"><div className="grid gap-5 lg:grid-cols-[1fr_360px]"><div className="grid gap-3 md:grid-cols-2">
-    {(["showBusinessName", "showTime", "showOrderNumber", "showOrderSource", "groupByCategory", "highlightNotes"] as const).map((key) => <Toggle key={key} label={{ showBusinessName: "Mostrar negocio", showTime: "Mostrar hora", showOrderNumber: "Mostrar numero", showOrderSource: "Mostrar mesa/tipo", groupByCategory: "Agrupar por categoria", highlightNotes: "Resaltar notas" }[key]} checked={settings[key]} onChange={(value) => setSettings({ ...settings, [key]: value })} />)}
+    {(["showBusinessName", "showLogo", "showTime", "showOrderNumber", "showOrderSource", "showCashier", "groupByCategory", "highlightNotes", "showAdditions"] as const).map((key) => <Toggle key={key} label={{ showBusinessName: "Mostrar negocio", showLogo: "Mostrar logo", showTime: "Mostrar hora", showOrderNumber: "Mostrar numero", showOrderSource: "Mostrar mesa/tipo", showCashier: "Mostrar cajero", groupByCategory: "Agrupar por categoria", highlightNotes: "Resaltar notas", showAdditions: "Mostrar adiciones" }[key]} checked={Boolean(settings[key])} onChange={(value) => setSettings({ ...settings, [key]: value })} />)}
+    <TextField label="Mensaje interno opcional" value={settings.internalMessage ?? ""} onChange={(value) => setSettings({ ...settings, internalMessage: value })} />
     <label className="space-y-1"><span className="text-sm font-bold">Tamano de tirilla</span><select className="min-h-11 w-full rounded-md border border-line px-3" value={settings.size} onChange={(event) => setSettings({ ...settings, size: event.target.value as KitchenSettings["size"] })}><option value="58mm">58mm</option><option value="80mm">80mm</option></select></label>
+    <button className="min-h-11 rounded-md bg-ink px-4 font-bold text-white" onClick={() => printService({ type: "browser", label: "Comanda de prueba" })}>Imprimir prueba</button>
   </div><PreviewKitchen settings={settings} /></div></SettingsCard>;
 }
 
@@ -1628,10 +1701,13 @@ function PrintModal({ business, settings, order, mode, role, onClose, onPrint }:
   const isKitchen = mode === "comanda";
   return <div className="fixed inset-0 z-40 grid place-items-center bg-ink/50 p-4"><div className="w-full max-w-md"><TicketShell title={isKitchen ? "Comanda de cocina" : mode === "detalle" ? "Detalle de orden" : settings.receipt.businessName} size={isKitchen ? settings.kitchen.size : settings.receipt.size}>
     {!isKitchen && settings.receipt.showLogo && business.logoUrl && <img src={business.logoUrl} alt="Logo" className="mx-auto mb-3 max-h-16" />}
+    {isKitchen && settings.kitchen.showLogo && business.logoUrl && <img src={business.logoUrl} alt="Logo" className="mx-auto mb-3 max-h-14" />}
+    {isKitchen && settings.kitchen.showBusinessName && <p className="text-center text-sm font-black">{business.name}</p>}
     {!isKitchen && <div className="text-center text-xs"><p>{settings.receipt.nit ? `NIT: ${settings.receipt.nit}` : business.nit ? `NIT: ${business.nit}` : ""}</p><p>{settings.receipt.address}</p><p>{settings.receipt.phone}</p></div>}
     <TicketHeader order={order} settings={settings} mode={mode} />
-    <div className="mt-4 space-y-3">{order.items.map((item) => <div key={item.id} className="border-t border-dashed border-slate-400 pt-3"><div className="flex justify-between gap-3"><p className="font-black">{item.quantity} x {item.productName}</p>{!isKitchen && <p>{money.format(itemUnitTotal(item) * item.quantity)}</p>}</div>{!isKitchen && <p className="text-xs">Unitario: {money.format(item.price)}</p>}{item.additions.map((addition) => <p key={addition.id} className="text-sm">+ {addition.name} {!isKitchen ? money.format(addition.price) : ""}</p>)}{item.notes && <p className={`mt-1 text-sm ${settings.kitchen.highlightNotes ? "font-black" : "font-bold"}`}>Nota: {item.notes}</p>}</div>)}</div>
+    <div className="mt-4 space-y-3">{order.items.map((item) => <div key={item.id} className="border-t border-dashed border-slate-400 pt-3"><div className="flex justify-between gap-3"><p className="font-black">{item.quantity} x {item.productName}</p>{!isKitchen && <p>{money.format(itemUnitTotal(item) * item.quantity)}</p>}</div>{!isKitchen && <p className="text-xs">Unitario: {money.format(item.price)}</p>}{(!isKitchen || settings.kitchen.showAdditions) && item.additions.map((addition) => <p key={addition.id} className="text-sm">+ {addition.name} {!isKitchen ? money.format(addition.price) : ""}</p>)}{item.notes && (!isKitchen ? settings.receipt.showItemNotes : true) && <p className={`mt-1 text-sm ${isKitchen && settings.kitchen.highlightNotes ? "font-black" : "font-bold"}`}>Nota: {item.notes}</p>}</div>)}</div>
     {!isKitchen && <><Totals order={order} receipt={settings.receipt} /><p className="mt-3 text-sm font-bold">Pago: {order.paymentMethod ?? "Pendiente"}</p><p className="mt-2 text-center text-sm">{settings.receipt.footerMessage}</p><p className="text-center text-xs">{settings.receipt.socialText}</p></>}
+    {isKitchen && settings.kitchen.internalMessage && <p className="mt-3 border-t border-dashed border-slate-400 pt-2 text-center text-sm font-bold">{settings.kitchen.internalMessage}</p>}
     {mode === "detalle" && role === "admin" && <AuditTrail events={order.audit} />}
   </TicketShell><div className="no-print mt-3 flex gap-2"><button className="flex min-h-12 flex-1 items-center justify-center gap-2 rounded-md bg-ink px-4 font-bold text-white" onClick={() => { onPrint(isKitchen ? "Comanda impresa" : "Recibo impreso"); printService({ type: settings.printing.type, label: isKitchen ? "Comanda" : "Recibo" }); }}><Printer size={20} /> {isKitchen ? "Reimprimir comanda" : "Reimprimir recibo"}</button><IconButton title="Cerrar" onClick={onClose}><X size={20} /></IconButton></div></div></div>;
 }
@@ -1697,7 +1773,7 @@ function PreviewReceipt({ settings }: { settings: ReceiptSettings }) {
 }
 
 function PreviewKitchen({ settings }: { settings: KitchenSettings }) {
-  return <TicketShell title={settings.showBusinessName ? "Mi Restaurante" : "Comanda"} size={settings.size}>{settings.showOrderNumber && <p>Orden: #123</p>}{settings.showOrderSource && <p>Mesa 4</p>}{settings.showTime && <p>{formatTime(new Date())}</p>}<div className="mt-3 border-t border-dashed border-slate-400 pt-3"><p className="font-black">2 x Burger clasica</p><p className={settings.highlightNotes ? "font-black" : ""}>Nota: sin cebolla</p><p>+ Bacon</p></div></TicketShell>;
+  return <TicketShell title={settings.showBusinessName ? "Mi Restaurante" : "Comanda"} size={settings.size}>{settings.showOrderNumber && <p>Orden: #123</p>}{settings.showOrderSource && <p>Mesa 4</p>}{settings.showCashier && <p>Cajero: demo@pos.com</p>}{settings.showTime && <p>{formatTime(new Date())}</p>}<div className="mt-3 border-t border-dashed border-slate-400 pt-3"><p className="font-black">2 x Burger clasica</p>{settings.showAdditions && <p>+ Bacon</p>}<p className={settings.highlightNotes ? "font-black" : ""}>Nota: sin cebolla</p></div>{settings.internalMessage && <p className="mt-2 text-center text-sm font-bold">{settings.internalMessage}</p>}</TicketShell>;
 }
 
 function TicketShell({ title, size, children }: { title: string; size?: string; children: ReactNode }) {
@@ -1709,7 +1785,7 @@ function TicketShell({ title, size, children }: { title: string; size?: string; 
 function TicketHeader({ order, settings, mode }: { order: Order; settings: AppSettings; mode: Exclude<PrintMode, null> }) {
   const isKitchen = mode === "comanda";
   const date = order.closedAt ?? order.createdAt;
-  return <div className="mt-4 space-y-1 text-sm">{!isKitchen && <p>Recibo: R-{String(order.number).padStart(5, "0")}</p>}{(!isKitchen || settings.kitchen.showOrderNumber) && <p>Orden: #{order.number}</p>}{!isKitchen && <p>Cajero: {order.cashier ?? "-"}</p>}{(!isKitchen || settings.kitchen.showOrderSource) && <p>{order.tableName ?? order.type}</p>}{!isKitchen && <p>Fecha: {formatDate(date)}</p>}{!isKitchen && <p>Hora: {formatTime(date)}</p>}{isKitchen && settings.kitchen.showTime && <p>{formatDateTime(date)}</p>}</div>;
+  return <div className="mt-4 space-y-1 text-sm">{!isKitchen && <p>Recibo: R-{String(order.number).padStart(5, "0")}</p>}{(!isKitchen || settings.kitchen.showOrderNumber) && <p>Orden: #{order.number}</p>}{!isKitchen && settings.receipt.showCashier && <p>Cajero: {order.cashier ?? "-"}</p>}{isKitchen && settings.kitchen.showCashier && <p>Cajero: {order.cashier ?? "-"}</p>}{((!isKitchen && settings.receipt.showOrderSource) || (isKitchen && settings.kitchen.showOrderSource)) && <p>{order.tableName ?? order.type}</p>}{!isKitchen && <p>Fecha: {formatDate(date)}</p>}{!isKitchen && <p>Hora: {formatTime(date)}</p>}{isKitchen && settings.kitchen.showTime && <p>{formatDateTime(date)}</p>}</div>;
 }
 
 function Totals({ order, receipt = initialSettings.receipt }: { order: Order; receipt?: ReceiptSettings }) {

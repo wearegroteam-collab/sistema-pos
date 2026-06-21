@@ -2,7 +2,8 @@ export type Role = "super_admin" | "admin" | "cajero";
 export type BusinessStatus = "active" | "inactive" | "deleted";
 export type UserStatus = "active" | "inactive";
 export type InvitationStatus = "pending" | "accepted" | "expired";
-export type TableStatus = "libre" | "ocupada" | "esperando_pago";
+export type TableStatus = "libre" | "ocupada" | "esperando_pago" | "bloqueada";
+export type TableShape = "square" | "rectangle" | "circle";
 export type OrderType = "mesa" | "pickup" | "delivery";
 export type OrderStatus = "abierta" | "en_cocina" | "pagada" | "cancelada" | "anulada";
 export type PaymentMethod = "efectivo" | "tarjeta" | "transferencia" | "ATH" | "Zelle" | "otro";
@@ -41,6 +42,12 @@ export type RestaurantTable = {
   name: string;
   status: TableStatus;
   sortOrder: number;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  shape?: TableShape;
+  zone?: string;
 };
 
 export type OrderItemAddition = {
@@ -119,16 +126,23 @@ export type ReceiptSettings = {
   footerMessage: string;
   socialText: string;
   showTip: boolean;
+  showCashier: boolean;
+  showOrderSource: boolean;
+  showItemNotes: boolean;
   size: KitchenSize;
 };
 
 export type KitchenSettings = {
   showBusinessName: boolean;
+  showLogo: boolean;
   showTime: boolean;
   showOrderNumber: boolean;
   showOrderSource: boolean;
+  showCashier: boolean;
   groupByCategory: boolean;
   highlightNotes: boolean;
+  showAdditions: boolean;
+  internalMessage?: string;
   size: KitchenSize;
 };
 
