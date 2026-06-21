@@ -390,6 +390,20 @@ function mapInvitationRow(row: Record<string, unknown>): Invitation | null {
   };
 }
 
+async function getFunctionErrorMessage(error: unknown, fallback: string) {
+  const context = (error as { context?: Response })?.context;
+  if (context?.json) {
+    try {
+      const body = await context.json();
+      const code = body?.code ? `${body.code}: ` : "";
+      return `${code}${body?.error ?? body?.message ?? fallback}`;
+    } catch {
+      return (error as { message?: string })?.message ?? fallback;
+    }
+  }
+  return (error as { message?: string })?.message ?? fallback;
+}
+
 export function PosApp() {
   const initialPath = typeof window === "undefined" ? "/" : window.location.pathname;
   const [businesses, setBusinesses] = useState<Business[]>([initialBusiness]);
@@ -1146,7 +1160,8 @@ function SuperAdminPanelV3({ businesses, setBusinesses, users, setUsers, invitat
     if (!supabase) return setInviteStatus({ tone: "error", message: "Supabase no esta configurado. No se puede enviar la invitacion." });
     setInviteStatus({ tone: "info", message: "Enviando invitacion..." });
     const { data, error } = await supabase.functions.invoke("invite-user", { body: { action: "create_business", business_name: draft.name.trim(), admin_email: draft.email.trim().toLowerCase(), phone: draft.phone.trim() || null, is_demo: draft.kind === "demo", redirect_to: `${window.location.origin}/pos` } });
-    if (error || data?.error) return setInviteStatus({ tone: "error", message: data?.error ?? error?.message ?? "Error enviando invitacion." });
+    if (error) return setInviteStatus({ tone: "error", message: await getFunctionErrorMessage(error, "Error enviando invitacion.") });
+    if (data?.error) return setInviteStatus({ tone: "error", message: `${data.code ? `${data.code}: ` : ""}${data.error}` });
     const businessId = data.business.id as string;
     const business = mapBusinessRow(data.business as Record<string, unknown>);
     setBusinesses((current) => [business, ...current]);
@@ -1160,7 +1175,8 @@ function SuperAdminPanelV3({ businesses, setBusinesses, users, setUsers, invitat
     if (!supabase) return setInviteStatus({ tone: "error", message: "Supabase no esta configurado. No se puede reenviar la invitacion." });
     setInviteStatus({ tone: "info", message: "Reenviando invitacion..." });
     const { data, error } = await supabase.functions.invoke("invite-user", { body: { action: "resend_admin_invitation", business_id: businessId, redirect_to: `${window.location.origin}/pos` } });
-    if (error || data?.error) return setInviteStatus({ tone: "error", message: data?.error ?? error?.message ?? "Error reenviando invitacion." });
+    if (error) return setInviteStatus({ tone: "error", message: await getFunctionErrorMessage(error, "Error reenviando invitacion.") });
+    if (data?.error) return setInviteStatus({ tone: "error", message: `${data.code ? `${data.code}: ` : ""}${data.error}` });
     setInvitations((current) => current.map((invite) => invite.businessId === businessId && invite.role === "admin" ? { ...invite, status: "pending", createdAt: now() } : invite));
     setInviteStatus({ tone: "ok", message: data.invite_status === "reset_sent" ? "El usuario ya existia. Se envio correo para restablecer contrasena." : "Invitacion reenviada." });
   }
