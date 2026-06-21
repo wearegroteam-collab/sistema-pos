@@ -15,8 +15,13 @@ Apply migrations:
 Email auth:
 
 - Enable Email provider in Supabase Auth.
-- For admin/cashier invitations, create a row in `invitations`, then call Supabase Auth Admin API `inviteUserByEmail` or `generateLink`.
-- After the invited user signs in, call `accept_invitation(token)` to attach the user to `business_users`.
+- Configure Authentication > URL Configuration:
+  - Site URL: `https://TU-DOMINIO.vercel.app`
+  - Redirect URL: `https://TU-DOMINIO.vercel.app/auth/callback`
+  - Redirect URL: `https://TU-DOMINIO.vercel.app/set-password`
+- The `invite-user` Edge Function sends invitations and recovery links to `${SITE_URL}/auth/callback`.
+- `/auth/callback` creates the Supabase session from the invite/recovery link.
+- `/set-password` lets the user create a password, then redirects by role from `business_users`.
 
 Security:
 

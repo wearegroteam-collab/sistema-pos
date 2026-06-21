@@ -18,7 +18,7 @@ Configura estos secrets para la funcion `invite-user`:
 ```text
 SUPABASE_URL=https://TU_PROYECTO.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=TU_SERVICE_ROLE_KEY
-SITE_URL=https://TU_DOMINIO.com
+SITE_URL=https://TU-DOMINIO.vercel.app
 ```
 
 Comando recomendado:
@@ -26,7 +26,7 @@ Comando recomendado:
 ```bash
 supabase secrets set SUPABASE_URL=https://TU_PROYECTO.supabase.co
 supabase secrets set SUPABASE_SERVICE_ROLE_KEY=TU_SERVICE_ROLE_KEY
-supabase secrets set SITE_URL=https://TU_DOMINIO.com
+supabase secrets set SITE_URL=https://TU-DOMINIO.vercel.app
 ```
 
 Luego despliega:
@@ -42,3 +42,15 @@ La funcion maneja:
 - Enviar email real con Supabase Auth.
 - Si el usuario ya existe, vincularlo al negocio y enviar correo de recuperacion/restablecimiento.
 - Reenviar invitacion admin.
+
+## URLs de autenticacion en Supabase
+
+En **Authentication > URL Configuration** agrega:
+
+```text
+Site URL: https://TU-DOMINIO.vercel.app
+Redirect URL: https://TU-DOMINIO.vercel.app/auth/callback
+Redirect URL: https://TU-DOMINIO.vercel.app/set-password
+```
+
+La funcion `invite-user` siempre envia el enlace a `${SITE_URL}/auth/callback`. Esa ruta crea la sesion y luego envia al usuario a `/set-password` para definir su contrasena.

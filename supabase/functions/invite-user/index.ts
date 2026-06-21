@@ -84,8 +84,8 @@ function safeMessage(error: unknown) {
   return String(error);
 }
 
-function redirectTo(siteUrl: string, bodyRedirect?: string) {
-  return bodyRedirect ?? `${siteUrl.replace(/\/$/, "")}/pos`;
+function redirectTo(siteUrl: string) {
+  return `${siteUrl.replace(/\/$/, "")}/auth/callback`;
 }
 
 function validateEmail(email?: string) {
@@ -226,7 +226,7 @@ Deno.serve(async (req) => {
 
       await assertSuperAdmin(caller, requestId);
       const adminEmail = body.admin_email.toLowerCase().trim();
-      const redirect = redirectTo(siteUrl, body.redirect_to);
+      const redirect = redirectTo(siteUrl);
 
       log(requestId, "business_creation_started", { business_name: body.business_name.trim(), admin_email: adminEmail });
       const { data: business, error: businessError } = await admin
@@ -317,7 +317,7 @@ Deno.serve(async (req) => {
       }
       log(requestId, "admin_invitation_found", { invitation_id: invite.id, business_id: invite.business_id, email: invite.email });
 
-      const authResult = await sendInviteOrReset(admin, invite.email, redirectTo(siteUrl, body.redirect_to), requestId);
+      const authResult = await sendInviteOrReset(admin, invite.email, redirectTo(siteUrl), requestId);
       if (authResult.status === "error") {
         return errorResponse(requestId, 400, "FAILED_SENDING_AUTH_INVITE", "Failed sending auth invite", authResult.message);
       }
@@ -357,7 +357,7 @@ Deno.serve(async (req) => {
     const email = body.email.toLowerCase().trim();
     const role = body.role;
     const permissions = body.permissions ?? {};
-    const authResult = await sendInviteOrReset(admin, email, redirectTo(siteUrl, body.redirect_to), requestId);
+    const authResult = await sendInviteOrReset(admin, email, redirectTo(siteUrl), requestId);
     if (authResult.status === "error") {
       return errorResponse(requestId, 400, "FAILED_SENDING_AUTH_INVITE", "Failed sending auth invite", authResult.message);
     }
