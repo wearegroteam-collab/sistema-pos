@@ -1,6 +1,6 @@
 import { supabase } from "@/lib/supabase";
 
-type BusinessUserRole = "super_admin" | "admin" | "cajero" | "cashier";
+type BusinessUserRole = "super_admin" | "admin" | "supervisor" | "cajero" | "cashier";
 
 export async function getRedirectPathForCurrentUser() {
   if (!supabase) return { path: "/", error: "Supabase no esta configurado." };
@@ -10,7 +10,7 @@ export async function getRedirectPathForCurrentUser() {
 
   const { data: rows, error } = await supabase
     .from("business_users")
-    .select("role,status")
+    .select("role,status,force_password_change")
     .eq("user_id", userData.user.id)
     .eq("status", "active");
 
@@ -19,7 +19,8 @@ export async function getRedirectPathForCurrentUser() {
 
   const roles = rows.map((row) => row.role as BusinessUserRole);
   if (roles.includes("super_admin")) return { path: "/super-admin" };
-  if (roles.includes("admin")) return { path: "/pos" };
+  if (rows.some((row) => Boolean(row.force_password_change))) return { path: "/change-password" };
+  if (roles.includes("admin") || roles.includes("supervisor")) return { path: "/pos" };
   if (roles.includes("cashier") || roles.includes("cajero")) return { path: "/pos/mesas" };
   return { path: "/", error: "Rol no configurado." };
 }

@@ -1,4 +1,4 @@
-export type Role = "super_admin" | "admin" | "cajero";
+export type Role = "super_admin" | "admin" | "supervisor" | "cajero";
 export type BusinessStatus = "active" | "inactive" | "deleted";
 export type UserStatus = "active" | "inactive";
 export type InvitationStatus = "pending" | "accepted" | "expired";
@@ -225,11 +225,13 @@ export type CashShift = {
 export type BusinessUser = {
   id: string;
   businessId: string;
+  userId?: string;
   email: string;
   name: string;
   role: Role;
   status: UserStatus;
   permissions: CashierPermissions;
+  forcePasswordChange?: boolean;
   createdAt: string;
 };
 

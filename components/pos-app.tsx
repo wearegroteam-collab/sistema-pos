@@ -354,13 +354,13 @@ function getShiftSummary(shift: CashShift, orders: Order[]) {
 }
 
 function normalizeRole(role?: string | null): Role | null {
-  if (role === "super_admin" || role === "admin" || role === "cajero") return role;
+  if (role === "super_admin" || role === "admin" || role === "supervisor" || role === "cajero") return role;
   if (role === "cashier") return "cajero";
   return null;
 }
 
 function normalizePermissions(role: Role, permissions?: Partial<CashierPermissions> | null): CashierPermissions {
-  if (role === "super_admin" || role === "admin") return superAdminPermissions;
+  if (role === "super_admin" || role === "admin" || role === "supervisor") return superAdminPermissions;
   return { ...defaultCashierPermissions, ...(permissions ?? {}) };
 }
 
@@ -390,11 +390,13 @@ function mapBusinessUserRow(row: Record<string, unknown>, fallbackEmail: string)
   return {
     id: String(row.id),
     businessId: row.business_id ? String(row.business_id) : "system",
+    userId: row.user_id ? String(row.user_id) : undefined,
     email: String(row.email ?? fallbackEmail).toLowerCase(),
     name: String(row.full_name ?? row.email ?? fallbackEmail),
     role,
     status: row.status === "inactive" ? "inactive" : "active",
     permissions: normalizePermissions(role, row.permissions as Partial<CashierPermissions> | null),
+    forcePasswordChange: Boolean(row.force_password_change),
     createdAt: String(row.created_at ?? now())
   };
 }
@@ -426,6 +428,38 @@ async function getFunctionErrorMessage(error: unknown, fallback: string) {
     }
   }
   return (error as { message?: string })?.message ?? fallback;
+}
+
+async function postAdminApi(path: string, body: Record<string, unknown>) {
+  if (!supabase) throw new Error("Supabase no esta configurado.");
+  const { data } = await supabase.auth.getSession();
+  if (!data.session) throw new Error("Sesion expirada.");
+  const response = await fetch(path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${data.session.access_token}`
+    },
+    body: JSON.stringify(body)
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error ?? "Error en el servidor.");
+  return payload;
+}
+
+function mapApiBusinessUser(row: Record<string, unknown>, fallbackEmail = ""): BusinessUser {
+  return {
+    id: String(row.id),
+    businessId: String(row.businessId ?? row.business_id),
+    userId: row.userId || row.user_id ? String(row.userId ?? row.user_id) : undefined,
+    email: String(row.email ?? fallbackEmail).toLowerCase(),
+    name: String(row.name ?? row.full_name ?? row.email ?? fallbackEmail),
+    role: normalizeRole(String(row.role ?? "")) ?? "cajero",
+    status: row.status === "inactive" ? "inactive" : "active",
+    permissions: normalizePermissions((normalizeRole(String(row.role ?? "")) ?? "cajero"), row.permissions as Partial<CashierPermissions> | null),
+    forcePasswordChange: Boolean(row.forcePasswordChange ?? row.force_password_change),
+    createdAt: String(row.createdAt ?? row.created_at ?? now())
+  };
 }
 
 export function PosApp() {
@@ -462,6 +496,11 @@ export function PosApp() {
   const isSupportMode = role === "super_admin" && Boolean(supportBusinessId);
 
   useEffect(() => {
+    if (initialPath === "/change-password") return;
+    if (window.sessionStorage.getItem("force_password_change") === "true") {
+      window.location.replace("/change-password");
+      return;
+    }
     if (initialPath === "/set-password") return;
     if (window.sessionStorage.getItem("require_password_setup") === "true") {
       window.location.replace("/set-password");
@@ -682,7 +721,7 @@ export function PosApp() {
     setAuthLoading(true);
     const { data: rows, error } = await supabase
       .from("business_users")
-      .select("id,business_id,email,full_name,role,status,permissions,created_at")
+      .select("id,business_id,user_id,email,full_name,role,status,permissions,force_password_change,created_at")
       .eq("user_id", authUser.id)
       .eq("status", "active");
 
@@ -714,6 +753,13 @@ export function PosApp() {
     });
     setRole(selectedUser.role);
     setSession({ email: selectedUser.email, userId: authUser.id });
+    if (selectedUser.forcePasswordChange && typeof window !== "undefined" && initialPath !== "/change-password") {
+      window.sessionStorage.setItem("force_password_change", "true");
+      setAuthLoading(false);
+      window.location.assign("/change-password");
+      return true;
+    }
+    window.sessionStorage.removeItem("force_password_change");
 
     if (selectedUser.role === "super_admin") {
       const { data: businessRows } = await supabase
@@ -724,7 +770,7 @@ export function PosApp() {
 
       const { data: userRows } = await supabase
         .from("business_users")
-        .select("id,business_id,email,full_name,role,status,permissions,created_at")
+        .select("id,business_id,user_id,email,full_name,role,status,permissions,force_password_change,created_at")
         .order("created_at", { ascending: false });
       if (userRows) {
         const users = userRows
@@ -753,7 +799,7 @@ export function PosApp() {
       }
       const { data: businessUserRows } = await supabase
         .from("business_users")
-        .select("id,business_id,email,full_name,role,status,permissions,created_at")
+        .select("id,business_id,user_id,email,full_name,role,status,permissions,force_password_change,created_at")
         .eq("business_id", selectedUser.businessId)
         .order("created_at", { ascending: false });
       if (businessUserRows) {
@@ -798,6 +844,7 @@ export function PosApp() {
   async function handleLogout() {
     if (supabase) await supabase.auth.signOut();
     window.sessionStorage.removeItem("require_password_setup");
+    window.sessionStorage.removeItem("force_password_change");
     setSession(null);
     setRole("admin");
     setActiveBusinessId(initialBusiness.id);
@@ -826,7 +873,13 @@ export function PosApp() {
     setActiveBusinessId(initialBusiness.id);
   }
 
+  const forcePasswordChangeRequired = typeof window !== "undefined" && initialPath !== "/change-password" && window.sessionStorage.getItem("force_password_change") === "true";
   const passwordSetupRequired = typeof window !== "undefined" && initialPath !== "/set-password" && window.sessionStorage.getItem("require_password_setup") === "true";
+
+  if (forcePasswordChangeRequired) {
+    window.location.replace("/change-password");
+    return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-xl font-black">Redirigiendo para cambiar contrasena...</h1></section></main>;
+  }
 
   if (passwordSetupRequired) {
     window.location.replace("/set-password");
@@ -868,7 +921,7 @@ export function PosApp() {
       window.location.replace("/super-admin");
       return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-xl font-black">Redirigiendo...</h1></section></main>;
     }
-    return <SuperAdminPanelV3 businesses={businesses} setBusinesses={setBusinesses} users={businessUsers} setUsers={setBusinessUsers} invitations={invitations} setInvitations={setInvitations} orders={orders} onSupport={enterSupportMode} onLogout={handleLogout} />;
+    return <SuperAdminPanelV4 businesses={businesses} setBusinesses={setBusinesses} users={businessUsers} setUsers={setBusinessUsers} orders={orders} onSupport={enterSupportMode} onLogout={handleLogout} />;
   }
 
   if (!isSupportMode && currentBusiness.status === "inactive") {
@@ -914,9 +967,9 @@ export function PosApp() {
           {can("viewTables") && <TabButton icon={<LayoutDashboard size={18} />} label="Dashboard" tab="dashboard" current={tab} onClick={setTab} />}
           {can("viewTables") && <TabButton icon={<Home size={18} />} label="Vender" tab="vender" current={tab} onClick={setTab} />}
           {can("viewOrders") && <TabButton icon={<ShoppingBag size={18} />} label="Ventas" tab="ventas" current={tab} onClick={setTab} />}
-          {can("modifyMenu") && <TabButton icon={<Utensils size={18} />} label="Menu" tab="menu" current={tab} onClick={setTab} />}
+          {can("modifyMenu") && <TabButton icon={<Utensils size={18} />} label="Productos" tab="menu" current={tab} onClick={setTab} />}
           {can("viewReports") && <TabButton icon={<BarChart3 size={18} />} label="Reportes" tab="reportes" current={tab} onClick={setTab} />}
-          {can("modifySettings") && <TabButton icon={<Settings size={18} />} label="Ajustes" tab="ajustes" current={tab} onClick={setTab} />}
+          {can("modifySettings") && <TabButton icon={<Settings size={18} />} label="Configuracion" tab="ajustes" current={tab} onClick={setTab} />}
         </nav>
       </div>
 
@@ -981,9 +1034,19 @@ function DashboardView({ orders, products }: { orders: Order[]; products: Produc
     const total = realPaid.filter((order) => inDateRange(order.closedAt ?? order.createdAt, key, key)).reduce((sum, order) => sum + order.total, 0);
     return { key, label: day.toLocaleDateString("es-CO", { weekday: "short", timeZone: "America/Bogota" }), total };
   });
+  const last30Days = Array.from({ length: 30 }, (_, index) => {
+    const day = startOfDay(new Date());
+    day.setDate(day.getDate() - (29 - index));
+    const key = toDateInput(day);
+    const total = realPaid.filter((order) => inDateRange(order.closedAt ?? order.createdAt, key, key)).reduce((sum, order) => sum + order.total, 0);
+    return { key, label: String(day.getDate()), total };
+  });
   const maxDay = Math.max(1, ...last7Days.map((day) => day.total));
+  const max30Day = Math.max(1, ...last30Days.map((day) => day.total));
   const monthOrders = realPaid.filter((order) => inDateRange(order.closedAt ?? order.createdAt, month.from, month.to));
   const topProducts = Object.entries(monthOrders.flatMap((order) => order.items).reduce<Record<string, number>>((acc, item) => ({ ...acc, [item.productName]: (acc[item.productName] ?? 0) + item.quantity }), {})).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const ordersByHour = Array.from({ length: 24 }, (_, hour) => ({ hour, count: monthOrders.filter((order) => new Date(order.closedAt ?? order.createdAt).getHours() === hour).length }));
+  const maxHour = Math.max(1, ...ordersByHour.map((row) => row.count));
   const knownProducts = products.length;
 
   return (
@@ -1027,6 +1090,34 @@ function DashboardView({ orders, products }: { orders: Order[]; products: Produc
               <div key={name} className="rounded-md bg-surface p-3">
                 <div className="flex justify-between gap-3 font-bold"><span>{index + 1}. {name}</span><span>{quantity}</span></div>
                 <div className="mt-2 h-2 rounded-full bg-white"><div className="h-2 rounded-full bg-accent" style={{ width: `${Math.max(8, (quantity / Math.max(1, topProducts[0]?.[1] ?? 1)) * 100)}%` }} /></div>
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
+      <div className="grid gap-5 lg:grid-cols-[1.25fr_0.75fr]">
+        <section className="rounded-md border border-line bg-white p-4 shadow-soft">
+          <h2 className="text-xl font-bold">Facturacion ultimos 30 dias</h2>
+          <div className="mt-5 flex h-56 items-end gap-1">
+            {last30Days.map((day) => (
+              <div key={day.key} className="flex min-w-0 flex-1 flex-col items-center gap-1">
+                <div className="flex h-40 w-full items-end rounded bg-surface">
+                  <div className="w-full rounded bg-brand" title={`${day.key}: ${money.format(day.total)}`} style={{ height: `${Math.max(4, (day.total / max30Day) * 100)}%` }} />
+                </div>
+                <span className="text-[10px] font-bold">{day.label}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+        <section className="rounded-md border border-line bg-white p-4 shadow-soft">
+          <h2 className="text-xl font-bold">Pedidos por hora</h2>
+          <div className="mt-4 space-y-2">
+            {ordersByHour.filter((row) => row.count > 0).length === 0 && <p className="rounded-md bg-surface p-3 text-sm text-slate-600">Sin pedidos pagados este mes.</p>}
+            {ordersByHour.filter((row) => row.count > 0).map((row) => (
+              <div key={row.hour} className="grid grid-cols-[52px_1fr_36px] items-center gap-2 text-sm">
+                <span className="font-bold">{String(row.hour).padStart(2, "0")}:00</span>
+                <div className="h-3 rounded-full bg-surface"><div className="h-3 rounded-full bg-accent" style={{ width: `${Math.max(8, (row.count / maxHour) * 100)}%` }} /></div>
+                <span className="text-right font-bold">{row.count}</span>
               </div>
             ))}
           </div>
@@ -1188,18 +1279,10 @@ function SuperAdminPanelV2({ businesses, setBusinesses, users, setUsers, invitat
       return;
     }
     setInviteStatus({ tone: "info", message: "Enviando invitacion..." });
-    const { data, error } = await supabase.functions.invoke("invite-user", {
-      body: {
-        action: "create_business",
-        business_name: draft.name.trim(),
-        admin_email: draft.email.trim().toLowerCase(),
-        phone: draft.phone.trim() || null,
-        is_demo: draft.kind === "demo",
-        redirect_to: `${window.location.origin}/pos`
-      }
-    });
+    const data = await postAdminApi("/api/admin/create-business", { name: draft.name.trim(), admin_email: draft.email.trim().toLowerCase(), phone: draft.phone.trim() || null, demo: draft.kind === "demo" });
+    const error: Error | null = null;
     if (error || data?.error) {
-      setInviteStatus({ tone: "error", message: data?.error ?? error?.message ?? "Error enviando invitacion." });
+      setInviteStatus({ tone: "error", message: data?.error ?? "Error creando usuario directo." });
       return;
     }
     const businessId = data.business.id as string;
@@ -1219,15 +1302,11 @@ function SuperAdminPanelV2({ businesses, setBusinesses, users, setUsers, invitat
       return;
     }
     setInviteStatus({ tone: "info", message: "Reenviando invitacion..." });
-    const { data, error } = await supabase.functions.invoke("invite-user", {
-      body: {
-        action: "resend_admin_invitation",
-        business_id: businessId,
-        redirect_to: `${window.location.origin}/pos`
-      }
-    });
+    const adminUser = users.find((user) => user.businessId === businessId && user.role === "admin");
+    const data = adminUser ? await postAdminApi("/api/admin/users", { action: "reset_password", business_id: businessId, business_user_id: adminUser.id }) : null;
+    const error = adminUser ? null : new Error("Admin no encontrado.");
     if (error || data?.error) {
-      setInviteStatus({ tone: "error", message: data?.error ?? error?.message ?? "Error reenviando invitacion." });
+      setInviteStatus({ tone: "error", message: data?.error ?? error?.message ?? "Error reseteando contrasena." });
       return;
     }
     setInvitations((current) => current.map((invite) => invite.businessId === businessId && invite.role === "admin" ? { ...invite, status: "pending", createdAt: now() } : invite));
@@ -1278,7 +1357,8 @@ function SuperAdminPanelV3({ businesses, setBusinesses, users, setUsers, invitat
     if (!draft.name.trim() || !draft.email.trim()) return;
     if (!supabase) return setInviteStatus({ tone: "error", message: "Supabase no esta configurado. No se puede enviar la invitacion." });
     setInviteStatus({ tone: "info", message: "Enviando invitacion..." });
-    const { data, error } = await supabase.functions.invoke("invite-user", { body: { action: "create_business", business_name: draft.name.trim(), admin_email: draft.email.trim().toLowerCase(), phone: draft.phone.trim() || null, is_demo: draft.kind === "demo", redirect_to: `${window.location.origin}/pos` } });
+    const data = await postAdminApi("/api/admin/create-business", { name: draft.name.trim(), admin_email: draft.email.trim().toLowerCase(), phone: draft.phone.trim() || null, demo: draft.kind === "demo" });
+    const error: Error | null = null;
     if (error) return setInviteStatus({ tone: "error", message: await getFunctionErrorMessage(error, "Error enviando invitacion.") });
     if (data?.error) return setInviteStatus({ tone: "error", message: `${data.code ? `${data.code}: ` : ""}${data.error}` });
     const businessId = data.business.id as string;
@@ -1293,7 +1373,9 @@ function SuperAdminPanelV3({ businesses, setBusinesses, users, setUsers, invitat
   async function resendAdminInvitation(businessId: string) {
     if (!supabase) return setInviteStatus({ tone: "error", message: "Supabase no esta configurado. No se puede reenviar la invitacion." });
     setInviteStatus({ tone: "info", message: "Reenviando invitacion..." });
-    const { data, error } = await supabase.functions.invoke("invite-user", { body: { action: "resend_admin_invitation", business_id: businessId, redirect_to: `${window.location.origin}/pos` } });
+    const adminUser = users.find((user) => user.businessId === businessId && user.role === "admin");
+    const data = adminUser ? await postAdminApi("/api/admin/users", { action: "reset_password", business_id: businessId, business_user_id: adminUser.id }) : null;
+    const error = adminUser ? null : new Error("Admin no encontrado.");
     if (error) return setInviteStatus({ tone: "error", message: await getFunctionErrorMessage(error, "Error reenviando invitacion.") });
     if (data?.error) return setInviteStatus({ tone: "error", message: `${data.code ? `${data.code}: ` : ""}${data.error}` });
     setInvitations((current) => current.map((invite) => invite.businessId === businessId && invite.role === "admin" ? { ...invite, status: "pending", createdAt: now() } : invite));
@@ -1325,6 +1407,102 @@ function SuperAdminPanelV3({ businesses, setBusinesses, users, setUsers, invitat
   const statusClass = (status: Business["status"]) => status === "active" ? "bg-emerald-100 text-emerald-800" : status === "deleted" ? "bg-red-100 text-red-800" : "bg-slate-200 text-slate-700";
 
   return <main className="min-h-screen bg-surface"><header className="border-b border-line bg-white"><div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-4"><div><p className="text-sm font-bold text-brand">Super Admin</p><h1 className="text-2xl font-black">Panel del sistema</h1></div><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={onLogout}>Salir</button></div></header><section className="mx-auto max-w-7xl space-y-4 px-4 py-5"><InnerTabs current={tab} onChange={setTab} tabs={[{ id: "businesses", label: "Negocios" }, { id: "invitations", label: "Invitaciones" }, { id: "checklist", label: "Checklist" }]} />{tab === "businesses" && <><SettingsCard title="Crear negocio"><div className="grid gap-3 md:grid-cols-[1fr_1fr_180px_160px_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Nombre del negocio" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" placeholder="Correo admin" value={draft.email} onChange={(event) => setDraft({ ...draft, email: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" placeholder="Telefono" value={draft.phone} onChange={(event) => setDraft({ ...draft, phone: event.target.value })} /><select className="min-h-11 rounded-md border border-line px-3" value={draft.kind} onChange={(event) => setDraft({ ...draft, kind: event.target.value as "real" | "demo" })}><option value="real">Real</option><option value="demo">Demo</option></select><button className="rounded-md bg-brand px-4 font-bold text-white" onClick={createBusiness}>Crear</button></div>{inviteStatus && <p className={`mt-2 rounded-md p-3 text-sm font-bold ${inviteStatus.tone === "ok" ? "bg-emerald-50 text-emerald-800" : inviteStatus.tone === "error" ? "bg-red-50 text-red-800" : "bg-sky-50 text-sky-800"}`}>{inviteStatus.message}</p>}</SettingsCard><SettingsCard title="Negocios"><div className="grid gap-3 lg:grid-cols-[1fr_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Buscar por negocio o correo admin" value={search} onChange={(event) => setSearch(event.target.value)} /><div className="flex gap-2 overflow-x-auto">{(["all", "real", "demo", "active", "inactive", "deleted"] as BusinessFilter[]).map((item) => <button key={item} className={`min-h-11 shrink-0 rounded-md border px-3 font-bold ${filter === item ? "border-brand bg-brand text-white" : "border-line bg-white"}`} onClick={() => setFilter(item)}>{item === "all" ? "Todos" : item === "real" ? "Reales" : item === "demo" ? "Demo" : item === "active" ? "Activos" : item === "inactive" ? "Inactivos" : "Eliminados"}</button>)}</div></div><div className="mt-4 grid gap-3 lg:grid-cols-2">{visibleBusinesses.map((business) => { const admin = users.find((user) => user.businessId === business.id && user.role === "admin"); return <article key={business.id} className="rounded-md border border-line bg-white p-4 shadow-soft"><div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="text-xl font-black">{business.name}</h2><p className="text-sm text-slate-600">{business.email || admin?.email || "Sin correo"} · {business.phone || "Sin telefono"}</p><p className="mt-1 text-sm text-slate-600">Admin: {admin?.email ?? "Pendiente"}</p></div><div className="flex gap-2"><span className={`rounded-md px-3 py-2 text-sm font-bold ${business.demo ? "bg-yellow-100 text-yellow-900" : "bg-sky-100 text-sky-900"}`}>{business.demo ? "Demo" : "Real"}</span><span className={`rounded-md px-3 py-2 text-sm font-bold ${statusClass(business.status)}`}>{business.status}</span></div></div><div className="mt-4 flex flex-wrap gap-2"><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => { setDetailId(business.id); setDeleteText(""); }}>Detalle</button><button disabled={business.status === "deleted"} className="rounded-md bg-brand px-3 py-2 font-bold text-white disabled:opacity-40" onClick={() => onSupport(business.id)}>Soporte</button><button disabled={business.status === "deleted"} className="rounded-md border border-line px-3 py-2 font-bold disabled:opacity-40" onClick={() => updateBusiness(business.id, { status: business.status === "active" ? "inactive" : "active" })}>{business.status === "active" ? "Desactivar" : "Activar"}</button></div></article>; })}</div></SettingsCard>{detail && <SettingsCard title="Detalle del negocio"><div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="text-2xl font-black">{detail.name}</h2><p className="text-sm text-slate-600">{detail.demo ? "Demo" : "Real"} · {detail.status}</p></div><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => setDetailId(null)}>Cerrar detalle</button></div><div className="mt-4 grid gap-3 md:grid-cols-2"><TextField label="Nombre" value={detail.name} onChange={(value) => updateBusiness(detail.id, { name: value, commercialName: value })} /><TextField label="Telefono" value={detail.phone} onChange={(value) => updateBusiness(detail.id, { phone: value })} /><SummaryRow label="Correo" value={detail.email || "-"} /><SummaryRow label="Estado" value={detail.status} /><SummaryRow label="Tipo" value={detail.demo ? "Demo" : "Real"} /><SummaryRow label="Creado" value={detail.createdAt ? formatDateTime(detail.createdAt) : "-"} /><SummaryRow label="Total ordenes" value={String(detailOrders.length)} /><SummaryRow label="Total vendido" value={money.format(detailTotal)} /><SummaryRow label="Ultima actividad" value={detailLastActivity ? formatDateTime(detailLastActivity) : "-"} /><SummaryRow label="Admin asignado" value={detailUsers.find((user) => user.role === "admin")?.email ?? "Pendiente"} /></div><div className="mt-4 flex flex-wrap gap-2"><button disabled={detail.status === "deleted"} className="rounded-md bg-brand px-3 py-2 font-bold text-white disabled:opacity-40" onClick={() => onSupport(detail.id)}>Entrar en soporte</button><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => resendAdminInvitation(detail.id)}>Reenviar invitacion admin</button></div><div className="mt-5 grid gap-4 lg:grid-cols-2"><div><h3 className="font-black">Usuarios y cajeros</h3><div className="mt-2 space-y-2">{detailUsers.map((user) => <div key={user.id} className="grid gap-2 rounded-md bg-surface p-3 text-sm md:grid-cols-[1fr_100px_auto] md:items-center"><span>{user.name} · {user.email}</span><strong>{user.role}</strong><button className="rounded-md border border-line bg-white px-3 py-2 font-bold" onClick={() => setUsers((current) => current.map((item) => item.id === user.id ? { ...item, status: item.status === "active" ? "inactive" : "active" } : item))}>{user.status === "active" ? "Desactivar" : "Activar"}</button></div>)}</div></div><div><h3 className="font-black">Invitaciones</h3><div className="mt-2 space-y-2">{detailInvitations.map((invite) => <div key={invite.id} className="rounded-md bg-surface p-3 text-sm">{invite.email} · {invite.role} · <strong>{invite.status}</strong></div>)}</div></div></div><div className="mt-5 rounded-md border border-red-200 bg-red-50 p-4"><h3 className="font-black text-red-900">Eliminar negocio</h3><p className="mt-1 text-sm text-red-800">Soft delete: se marcara como eliminado y se ocultara del listado principal. No se borran datos fisicos.</p><div className="mt-3 grid gap-2 sm:grid-cols-[1fr_auto]"><input className="min-h-11 rounded-md border border-red-200 px-3" placeholder="Escribe ELIMINAR para confirmar" value={deleteText} onChange={(event) => setDeleteText(event.target.value)} /><button disabled={deleteText !== "ELIMINAR"} className="rounded-md bg-red-700 px-4 font-bold text-white disabled:opacity-40" onClick={() => { updateBusiness(detail.id, { status: "deleted" }); setDetailId(null); setDeleteText(""); }}>Eliminar negocio</button></div></div></SettingsCard>}</>}{tab === "invitations" && <SettingsCard title="Invitaciones"><div className="space-y-2">{invitations.map((invite) => <div key={invite.id} className="grid gap-2 rounded-md bg-surface p-3 text-sm md:grid-cols-[1fr_120px_auto]"><span>{invite.email} · {invite.role} · {businesses.find((business) => business.id === invite.businessId)?.name}</span><strong>{invite.status}</strong><button className="rounded-md border border-line bg-white px-3 py-2 font-bold" onClick={() => invite.role === "admin" ? resendAdminInvitation(invite.businessId) : setInviteStatus({ tone: "info", message: "Reenvio disponible para invitaciones admin desde este panel." })}>Reenviar</button></div>)}</div></SettingsCard>}{tab === "checklist" && <AccessChecklist />}</section></main>;
+}
+
+function SuperAdminPanelV4({ businesses, setBusinesses, users, setUsers, orders, onSupport, onLogout }: { businesses: Business[]; setBusinesses: React.Dispatch<React.SetStateAction<Business[]>>; users: BusinessUser[]; setUsers: React.Dispatch<React.SetStateAction<BusinessUser[]>>; orders: Order[]; onSupport: (businessId: string) => void; onLogout: () => void }) {
+  type Tab = "businesses" | "users" | "subscriptions" | "deleted" | "checklist";
+  const [tab, setTab] = useState<Tab>("businesses");
+  const [draft, setDraft] = useState({ name: "", email: "", phone: "", kind: "real" as "real" | "demo" });
+  const [userDraft, setUserDraft] = useState({ businessId: businesses[0]?.id ?? "", email: "", name: "", role: "cajero" as Role });
+  const [search, setSearch] = useState("");
+  const [deleteText, setDeleteText] = useState("");
+  const [selectedBusinessId, setSelectedBusinessId] = useState<string | null>(null);
+  const [status, setStatus] = useState<{ tone: "ok" | "error" | "info"; message: string } | null>(null);
+  const [credentials, setCredentials] = useState<null | { email: string; password: string; label: string }>(null);
+  const activeBusinesses = businesses.filter((business) => business.status !== "deleted");
+  const deletedBusinesses = businesses.filter((business) => business.status === "deleted");
+  const visibleBusinesses = activeBusinesses.filter((business) => `${business.name} ${business.email} ${users.find((user) => user.businessId === business.id && user.role === "admin")?.email ?? ""}`.toLowerCase().includes(search.toLowerCase()));
+  const selectedBusiness = businesses.find((business) => business.id === selectedBusinessId) ?? null;
+
+  async function createBusiness() {
+    try {
+      setStatus({ tone: "info", message: "Creando negocio y usuario admin..." });
+      const payload = await postAdminApi("/api/admin/create-business", { name: draft.name, admin_email: draft.email, phone: draft.phone, demo: draft.kind === "demo" });
+      const business = mapBusinessRow(payload.business as Record<string, unknown>);
+      const user = mapApiBusinessUser(payload.user as Record<string, unknown>, draft.email);
+      setBusinesses((current) => [business, ...current.filter((item) => item.id !== business.id)]);
+      setUsers((current) => [user, ...current.filter((item) => item.id !== user.id)]);
+      setCredentials({ email: user.email, password: String(payload.temporary_password), label: `Admin de ${business.name}` });
+      setDraft({ name: "", email: "", phone: "", kind: "real" });
+      setStatus({ tone: "ok", message: "Negocio creado. Entrega las credenciales temporales al admin." });
+    } catch (error) {
+      setStatus({ tone: "error", message: error instanceof Error ? error.message : "No se pudo crear el negocio." });
+    }
+  }
+
+  async function createUser() {
+    try {
+      setStatus({ tone: "info", message: "Creando usuario..." });
+      const payload = await postAdminApi("/api/admin/users", { action: "create_user", business_id: userDraft.businessId, email: userDraft.email, full_name: userDraft.name, role: userDraft.role, permissions: defaultCashierPermissions });
+      const user = mapApiBusinessUser(payload.user as Record<string, unknown>, userDraft.email);
+      setUsers((current) => [user, ...current.filter((item) => item.id !== user.id)]);
+      setCredentials({ email: user.email, password: String(payload.temporary_password), label: user.name });
+      setUserDraft({ businessId: userDraft.businessId, email: "", name: "", role: "cajero" });
+      setStatus({ tone: "ok", message: "Usuario creado con contrasena temporal." });
+    } catch (error) {
+      setStatus({ tone: "error", message: error instanceof Error ? error.message : "No se pudo crear usuario." });
+    }
+  }
+
+  async function resetUserPassword(user: BusinessUser) {
+    try {
+      const payload = await postAdminApi("/api/admin/users", { action: "reset_password", business_id: user.businessId, business_user_id: user.id });
+      setUsers((current) => current.map((item) => item.id === user.id ? { ...item, forcePasswordChange: true } : item));
+      setCredentials({ email: user.email, password: String(payload.temporary_password), label: user.name });
+      setStatus({ tone: "ok", message: "Contrasena temporal generada." });
+    } catch (error) {
+      setStatus({ tone: "error", message: error instanceof Error ? error.message : "No se pudo resetear contrasena." });
+    }
+  }
+
+  async function updateUser(user: BusinessUser, patch: Partial<BusinessUser>) {
+    setUsers((current) => current.map((item) => item.id === user.id ? { ...item, ...patch } : item));
+    try {
+      await postAdminApi("/api/admin/users", { action: "update_user", business_id: user.businessId, business_user_id: user.id, full_name: patch.name, role: patch.role, status: patch.status, permissions: patch.permissions });
+    } catch (error) {
+      setStatus({ tone: "error", message: error instanceof Error ? error.message : "No se pudo actualizar usuario." });
+    }
+  }
+
+  async function deleteUser(user: BusinessUser) {
+    if (!window.confirm(`Eliminar usuario ${user.email}?`)) return;
+    try {
+      await postAdminApi("/api/admin/users", { action: "delete_user", business_id: user.businessId, business_user_id: user.id });
+      setUsers((current) => current.filter((item) => item.id !== user.id));
+    } catch (error) {
+      setStatus({ tone: "error", message: error instanceof Error ? error.message : "No se pudo eliminar usuario." });
+    }
+  }
+
+  async function deleteBusinessForever(business: Business) {
+    try {
+      await postAdminApi("/api/admin/delete-business", { business_id: business.id, confirmation: deleteText });
+      setBusinesses((current) => current.filter((item) => item.id !== business.id));
+      setUsers((current) => current.filter((user) => user.businessId !== business.id));
+      setSelectedBusinessId(null);
+      setDeleteText("");
+      setStatus({ tone: "ok", message: "Negocio eliminado definitivamente." });
+    } catch (error) {
+      setStatus({ tone: "error", message: error instanceof Error ? error.message : "No se pudo eliminar negocio." });
+    }
+  }
+
+  function copyCredentials() {
+    if (!credentials) return;
+    void navigator.clipboard.writeText(`Correo: ${credentials.email}\nContrasena temporal: ${credentials.password}`);
+  }
+
+  return <main className="min-h-screen bg-surface"><header className="border-b border-line bg-white"><div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-4"><div><p className="text-sm font-bold text-brand">Super Admin</p><h1 className="text-2xl font-black">Panel del sistema</h1></div><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={onLogout}>Salir</button></div></header><section className="mx-auto max-w-7xl space-y-4 px-4 py-5"><InnerTabs current={tab} onChange={setTab} tabs={[{ id: "businesses", label: "Negocios" }, { id: "users", label: "Usuarios" }, { id: "subscriptions", label: "Suscripciones" }, { id: "deleted", label: "Eliminados" }, { id: "checklist", label: "Checklist" }]} />{status && <p className={`rounded-md p-3 text-sm font-bold ${status.tone === "ok" ? "bg-emerald-50 text-emerald-800" : status.tone === "error" ? "bg-red-50 text-red-800" : "bg-sky-50 text-sky-800"}`}>{status.message}</p>}{credentials && <section className="rounded-md border border-emerald-200 bg-emerald-50 p-4 text-emerald-900"><h2 className="text-lg font-black">Credenciales temporales: {credentials.label}</h2><p className="mt-2 font-bold">Correo: {credentials.email}</p><p className="font-bold">Contrasena temporal: {credentials.password}</p><button className="mt-3 min-h-11 rounded-md bg-emerald-700 px-4 font-bold text-white" onClick={copyCredentials}>Copiar credenciales</button></section>}{tab === "businesses" && <><SettingsCard title="Crear negocio"><div className="grid gap-3 md:grid-cols-[1fr_1fr_180px_160px_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Nombre negocio" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" placeholder="Correo admin" value={draft.email} onChange={(event) => setDraft({ ...draft, email: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" placeholder="Telefono" value={draft.phone} onChange={(event) => setDraft({ ...draft, phone: event.target.value })} /><select className="min-h-11 rounded-md border border-line px-3" value={draft.kind} onChange={(event) => setDraft({ ...draft, kind: event.target.value as "real" | "demo" })}><option value="real">Real</option><option value="demo">Demo</option></select><button disabled={!draft.name.trim() || !draft.email.trim()} className="rounded-md bg-brand px-4 font-bold text-white disabled:opacity-40" onClick={createBusiness}>Crear</button></div></SettingsCard><SettingsCard title="Negocios"><input className="mb-4 min-h-11 w-full rounded-md border border-line px-3" placeholder="Buscar negocio o admin" value={search} onChange={(event) => setSearch(event.target.value)} /><div className="grid gap-3 lg:grid-cols-2">{visibleBusinesses.map((business) => { const admin = users.find((user) => user.businessId === business.id && user.role === "admin"); const total = orders.filter((order) => order.businessId === business.id && order.status === "pagada").reduce((sum, order) => sum + order.total, 0); return <article key={business.id} className="rounded-md border border-line bg-white p-4 shadow-soft"><div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="text-xl font-black">{business.name}</h2><p className="text-sm text-slate-600">{business.phone || "Sin telefono"} · Admin: {admin?.email ?? business.email}</p><p className="mt-1 text-sm font-bold">{business.demo ? "Demo" : "Real"} · {business.status} · Vendido: {money.format(total)}</p></div></div><div className="mt-4 flex flex-wrap gap-2"><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => setSelectedBusinessId(business.id)}>Editar negocio</button><button className="rounded-md bg-brand px-3 py-2 font-bold text-white" onClick={() => onSupport(business.id)}>Entrar como soporte</button><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => onSupport(business.id)}>Entrar como admin</button><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => setBusinesses((current) => current.map((item) => item.id === business.id ? { ...item, status: item.status === "active" ? "inactive" : "active" } : item))}>{business.status === "active" ? "Desactivar" : "Activar"}</button></div></article>; })}</div></SettingsCard>{selectedBusiness && <SettingsCard title="Editar negocio"><div className="grid gap-3 md:grid-cols-2"><TextField label="Nombre" value={selectedBusiness.name} onChange={(value) => setBusinesses((current) => current.map((item) => item.id === selectedBusiness.id ? { ...item, name: value, commercialName: value } : item))} /><TextField label="Telefono" value={selectedBusiness.phone} onChange={(value) => setBusinesses((current) => current.map((item) => item.id === selectedBusiness.id ? { ...item, phone: value } : item))} /><SummaryRow label="Tipo" value={selectedBusiness.demo ? "Demo" : "Real"} /><SummaryRow label="Usuarios" value={String(users.filter((user) => user.businessId === selectedBusiness.id).length)} /></div><div className="mt-5 rounded-md border border-red-200 bg-red-50 p-4"><h3 className="font-black text-red-900">Eliminar definitivamente</h3><p className="mt-1 text-sm text-red-800">Borra negocio, usuarios relacionados y datos operativos. Esta accion no es soft delete.</p><div className="mt-3 grid gap-2 sm:grid-cols-[1fr_auto]"><input className="min-h-11 rounded-md border border-red-200 px-3" placeholder="ELIMINAR DEFINITIVAMENTE" value={deleteText} onChange={(event) => setDeleteText(event.target.value)} /><button disabled={deleteText !== "ELIMINAR DEFINITIVAMENTE"} className="rounded-md bg-red-700 px-4 font-bold text-white disabled:opacity-40" onClick={() => deleteBusinessForever(selectedBusiness)}>Eliminar</button></div></div></SettingsCard>}</>}{tab === "users" && <><SettingsCard title="Crear usuario"><div className="grid gap-3 md:grid-cols-[1fr_1fr_1fr_160px_auto]"><select className="min-h-11 rounded-md border border-line px-3" value={userDraft.businessId} onChange={(event) => setUserDraft({ ...userDraft, businessId: event.target.value })}>{activeBusinesses.map((business) => <option key={business.id} value={business.id}>{business.name}</option>)}</select><input className="min-h-11 rounded-md border border-line px-3" placeholder="Correo" value={userDraft.email} onChange={(event) => setUserDraft({ ...userDraft, email: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" placeholder="Nombre" value={userDraft.name} onChange={(event) => setUserDraft({ ...userDraft, name: event.target.value })} /><select className="min-h-11 rounded-md border border-line px-3" value={userDraft.role} onChange={(event) => setUserDraft({ ...userDraft, role: event.target.value as Role })}><option value="admin">Admin</option><option value="supervisor">Supervisor</option><option value="cajero">Cajero</option></select><button disabled={!userDraft.businessId || !userDraft.email.trim()} className="rounded-md bg-brand px-4 font-bold text-white disabled:opacity-40" onClick={createUser}>Crear</button></div></SettingsCard><SettingsCard title="Usuarios"><div className="space-y-2">{users.filter((user) => user.role !== "super_admin").map((user) => <div key={user.id} className="grid gap-3 rounded-md border border-line p-3 lg:grid-cols-[1fr_180px_150px_auto] lg:items-center"><div><p className="font-bold">{user.name}</p><p className="text-sm text-slate-600">{user.email} · {businesses.find((business) => business.id === user.businessId)?.name ?? "Sin negocio"}{user.forcePasswordChange ? " · debe cambiar contrasena" : ""}</p></div><select className="min-h-10 rounded-md border border-line px-3" value={user.role} onChange={(event) => updateUser(user, { role: event.target.value as Role })}><option value="admin">Admin</option><option value="supervisor">Supervisor</option><option value="cajero">Cajero</option></select><button className={`rounded-md px-3 py-2 font-bold ${user.status === "active" ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-700"}`} onClick={() => updateUser(user, { status: user.status === "active" ? "inactive" : "active" })}>{user.status === "active" ? "Activo" : "Inactivo"}</button><div className="flex flex-wrap gap-2"><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => resetUserPassword(user)}>Resetear contrasena</button><IconButton title="Eliminar usuario" onClick={() => deleteUser(user)}><Trash2 size={18} /></IconButton></div></div>)}</div></SettingsCard></>}{tab === "subscriptions" && <SettingsCard title="Suscripciones"><div className="grid gap-3 lg:grid-cols-2">{activeBusinesses.map((business) => <div key={business.id} className="rounded-md border border-line p-3"><div className="flex items-center justify-between gap-3"><div><p className="font-black">{business.name}</p><p className="text-sm text-slate-600">{business.demo ? "Demo" : "Real"}</p></div><select className="min-h-10 rounded-md border border-line px-3" defaultValue={business.demo ? "demo" : "basico"}><option value="demo">Demo</option><option value="basico">Basico</option><option value="pro">Pro</option></select></div></div>)}</div></SettingsCard>}{tab === "deleted" && <SettingsCard title="Eliminados"><div className="space-y-2">{deletedBusinesses.length === 0 && <p className="rounded-md bg-surface p-3 text-sm">No hay negocios eliminados.</p>}{deletedBusinesses.map((business) => <div key={business.id} className="rounded-md bg-surface p-3 font-bold">{business.name}</div>)}</div></SettingsCard>}{tab === "checklist" && <AccessChecklist />}</section></main>;
 }
 
 function InnerTabs<T extends string>({ tabs, current, onChange }: { tabs: { id: T; label: string; icon?: ReactNode }[]; current: T; onChange: (tab: T) => void }) {
@@ -1743,7 +1921,7 @@ function SettingsView({ business, setBusiness, settings, setSettings, users, set
       {tab === "comanda" && <KitchenSettingsView settings={settings.kitchen} setSettings={(kitchen) => setSettings((current) => ({ ...current, kitchen }))} />}
       {tab === "impresion" && <PrintingSettingsView settings={settings} setSettings={setSettings} />}
       {tab === "pagos" && <PaymentSettings methods={settings.paymentMethods} setMethods={(paymentMethods) => setSettings((current) => ({ ...current, paymentMethods }))} />}
-      {tab === "usuarios" && <UsersPermissionsSettings businessId={activeBusinessId} users={users} setUsers={setUsers} invitations={invitations} setInvitations={setInvitations} invitedBy={currentUser} defaultPermissions={settings.cashierPermissions} setDefaultPermissions={(cashierPermissions) => setSettings((current) => ({ ...current, cashierPermissions }))} />}
+      {tab === "usuarios" && <BusinessUsersSettings businessId={activeBusinessId} users={users} setUsers={setUsers} defaultPermissions={settings.cashierPermissions} setDefaultPermissions={(cashierPermissions) => setSettings((current) => ({ ...current, cashierPermissions }))} />}
     </div>
   );
 }
@@ -1847,6 +2025,34 @@ function UsersPermissionsSettings({ businessId, users, setUsers, invitations, se
     setDraft({ email: "", name: "", role: "cajero" });
   }
   return <div className="space-y-4"><SettingsCard title="Invitar usuario"><div className="grid gap-3 md:grid-cols-[1fr_1fr_160px_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Correo" value={draft.email} onChange={(event) => setDraft({ ...draft, email: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" placeholder="Nombre" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /><select className="min-h-11 rounded-md border border-line px-3" value={draft.role} onChange={(event) => setDraft({ ...draft, role: event.target.value as Role })}><option value="admin">Admin</option><option value="cajero">Cajero</option></select><button className="min-h-11 rounded-md bg-brand px-4 font-bold text-white" onClick={inviteUser}>Invitar</button></div><p className="mt-3 text-sm text-slate-600">Con Supabase Auth conectado, esta accion debe llamar inviteUserByEmail/magic link para que el usuario cree su contrasena.</p></SettingsCard><SettingsCard title="Usuarios"><div className="space-y-3">{users.map((user) => <div key={user.id} className="rounded-md border border-line p-3"><div className="grid gap-2 md:grid-cols-[1fr_140px_130px]"><div><p className="font-bold">{user.name}</p><p className="text-sm text-slate-600">{user.email}</p></div><select className="min-h-10 rounded-md border border-line px-3" value={user.role} onChange={(event) => setUsers((current) => current.map((item) => item.id === user.id ? { ...item, role: event.target.value as Role } : item))}><option value="admin">Admin</option><option value="cajero">Cajero</option></select><button className={`rounded-md px-3 font-bold ${user.status === "active" ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-700"}`} onClick={() => setUsers((current) => current.map((item) => item.id === user.id ? { ...item, status: item.status === "active" ? "inactive" : "active" } : item))}>{user.status === "active" ? "Activo" : "Inactivo"}</button></div>{user.role === "cajero" && <div className="mt-3 grid gap-2 md:grid-cols-2">{(Object.keys(permissionLabels) as (keyof CashierPermissions)[]).map((key) => <Toggle key={key} label={permissionLabels[key]} checked={user.permissions[key]} onChange={(value) => setUsers((current) => current.map((item) => item.id === user.id ? { ...item, permissions: { ...item.permissions, [key]: value } } : item))} />)}</div>}</div>)}</div></SettingsCard><SettingsCard title="Permisos predeterminados de cajero"><div className="grid gap-3 md:grid-cols-2">{(Object.keys(permissionLabels) as (keyof CashierPermissions)[]).map((key) => <Toggle key={key} label={permissionLabels[key]} checked={defaultPermissions[key]} onChange={(value) => setDefaultPermissions({ ...defaultPermissions, [key]: value })} />)}</div></SettingsCard><SettingsCard title="Invitaciones"><div className="space-y-2">{invitations.length === 0 && <p className="rounded-md bg-surface p-3 text-sm">Sin invitaciones.</p>}{invitations.map((invite) => <div key={invite.id} className="flex justify-between rounded-md bg-surface p-3 text-sm"><span>{invite.email} · {invite.role}</span><strong>{invite.status}</strong></div>)}</div></SettingsCard></div>;
+}
+
+function BusinessUsersSettings({ businessId, users, setUsers, defaultPermissions, setDefaultPermissions }: { businessId: string; users: BusinessUser[]; setUsers: React.Dispatch<React.SetStateAction<BusinessUser[]>>; defaultPermissions: CashierPermissions; setDefaultPermissions: (permissions: CashierPermissions) => void }) {
+  const [draft, setDraft] = useState({ email: "", name: "", role: "cajero" as Role });
+  const [credentials, setCredentials] = useState<null | { email: string; password: string }>(null);
+  const [status, setStatus] = useState("");
+  async function createUser() {
+    try {
+      const payload = await postAdminApi("/api/admin/users", { action: "create_user", business_id: businessId, email: draft.email, full_name: draft.name, role: draft.role, permissions: defaultPermissions });
+      const user = mapApiBusinessUser(payload.user as Record<string, unknown>, draft.email);
+      setUsers((current) => [user, ...current.filter((item) => item.id !== user.id)]);
+      setCredentials({ email: user.email, password: String(payload.temporary_password) });
+      setDraft({ email: "", name: "", role: "cajero" });
+      setStatus("Usuario creado. Entrega la contrasena temporal.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "No se pudo crear usuario.");
+    }
+  }
+  async function resetPassword(user: BusinessUser) {
+    try {
+      const payload = await postAdminApi("/api/admin/users", { action: "reset_password", business_id: businessId, business_user_id: user.id });
+      setUsers((current) => current.map((item) => item.id === user.id ? { ...item, forcePasswordChange: true } : item));
+      setCredentials({ email: user.email, password: String(payload.temporary_password) });
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "No se pudo resetear contrasena.");
+    }
+  }
+  return <div className="space-y-4"><SettingsCard title="Crear usuario"><div className="grid gap-3 md:grid-cols-[1fr_1fr_160px_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Correo" value={draft.email} onChange={(event) => setDraft({ ...draft, email: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" placeholder="Nombre" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /><select className="min-h-11 rounded-md border border-line px-3" value={draft.role} onChange={(event) => setDraft({ ...draft, role: event.target.value as Role })}><option value="admin">Admin</option><option value="supervisor">Supervisor</option><option value="cajero">Cajero</option></select><button disabled={!draft.email.trim()} className="min-h-11 rounded-md bg-brand px-4 font-bold text-white disabled:opacity-40" onClick={createUser}>Crear</button></div>{status && <p className="mt-3 rounded-md bg-surface p-3 text-sm font-bold">{status}</p>}{credentials && <div className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm font-bold text-emerald-900"><p>Correo: {credentials.email}</p><p>Contrasena temporal: {credentials.password}</p><button className="mt-2 rounded-md bg-emerald-700 px-3 py-2 text-white" onClick={() => navigator.clipboard.writeText(`Correo: ${credentials.email}\nContrasena temporal: ${credentials.password}`)}>Copiar credenciales</button></div>}</SettingsCard><SettingsCard title="Usuarios"><div className="space-y-3">{users.map((user) => <div key={user.id} className="rounded-md border border-line p-3"><div className="grid gap-2 md:grid-cols-[1fr_150px_130px_auto]"><div><p className="font-bold">{user.name}</p><p className="text-sm text-slate-600">{user.email}{user.forcePasswordChange ? " · debe cambiar contrasena" : ""}</p></div><select className="min-h-10 rounded-md border border-line px-3" value={user.role} onChange={(event) => setUsers((current) => current.map((item) => item.id === user.id ? { ...item, role: event.target.value as Role } : item))}><option value="admin">Admin</option><option value="supervisor">Supervisor</option><option value="cajero">Cajero</option></select><button className={`rounded-md px-3 font-bold ${user.status === "active" ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-700"}`} onClick={() => setUsers((current) => current.map((item) => item.id === user.id ? { ...item, status: item.status === "active" ? "inactive" : "active" } : item))}>{user.status === "active" ? "Activo" : "Inactivo"}</button><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => resetPassword(user)}>Resetear</button></div>{user.role === "cajero" && <div className="mt-3 grid gap-2 md:grid-cols-2">{(Object.keys(permissionLabels) as (keyof CashierPermissions)[]).map((key) => <Toggle key={key} label={permissionLabels[key]} checked={user.permissions[key]} onChange={(value) => setUsers((current) => current.map((item) => item.id === user.id ? { ...item, permissions: { ...item.permissions, [key]: value } } : item))} />)}</div>}</div>)}</div></SettingsCard><SettingsCard title="Permisos predeterminados de cajero"><div className="grid gap-3 md:grid-cols-2">{(Object.keys(permissionLabels) as (keyof CashierPermissions)[]).map((key) => <Toggle key={key} label={permissionLabels[key]} checked={defaultPermissions[key]} onChange={(value) => setDefaultPermissions({ ...defaultPermissions, [key]: value })} />)}</div></SettingsCard></div>;
 }
 
 function ReportsView({ orders, shifts }: { orders: Order[]; shifts: CashShift[] }) {
