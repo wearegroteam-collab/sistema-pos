@@ -764,7 +764,7 @@ export function PosApp() {
     if (selectedUser.role === "super_admin") {
       const { data: businessRows } = await supabase
         .from("businesses")
-        .select("id,name,commercial_name,logo_url,address,phone,email,nit,status,test_mode,demo,onboarding_completed,onboarding_skipped,currency,timezone")
+        .select("id,name,logo_url,address,phone,email,nit,status,test_mode,demo,onboarding_completed,onboarding_skipped,currency,timezone")
         .order("created_at", { ascending: false });
       if (businessRows) setBusinesses(businessRows.map((row) => mapBusinessRow(row as Record<string, unknown>)));
 
@@ -790,7 +790,7 @@ export function PosApp() {
       setActiveBusinessId(selectedUser.businessId);
       const { data: businessRow } = await supabase
         .from("businesses")
-        .select("id,name,commercial_name,logo_url,address,phone,email,nit,status,test_mode,demo,onboarding_completed,onboarding_skipped,currency,timezone")
+        .select("id,name,logo_url,address,phone,email,nit,status,test_mode,demo,onboarding_completed,onboarding_skipped,currency,timezone")
         .eq("id", selectedUser.businessId)
         .maybeSingle();
       if (businessRow) {
@@ -1318,7 +1318,6 @@ function SuperAdminPanelV2({ businesses, setBusinesses, users, setUsers, invitat
     if (supabase) {
       const dbPatch: Record<string, unknown> = {};
       if (patch.name !== undefined) dbPatch.name = patch.name;
-      if (patch.commercialName !== undefined) dbPatch.commercial_name = patch.commercialName;
       if (patch.phone !== undefined) dbPatch.phone = patch.phone;
       if (patch.status !== undefined) dbPatch.status = patch.status;
       if (Object.keys(dbPatch).length) void supabase.from("businesses").update(dbPatch).eq("id", businessId);

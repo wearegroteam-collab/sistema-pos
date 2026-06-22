@@ -84,7 +84,7 @@ export async function POST(req: NextRequest) {
         test_mode: demo,
         onboarding_completed: demo
       })
-      .select("id,name,commercial_name,logo_url,address,phone,email,nit,status,test_mode,demo,onboarding_completed,onboarding_skipped,currency,timezone,created_at")
+      .select("id,name,logo_url,address,phone,email,nit,status,test_mode,demo,onboarding_completed,onboarding_skipped,currency,timezone,created_at")
       .single();
     if (businessError || !business) throw new Error(businessError?.message ?? "No se pudo crear el negocio.");
 
