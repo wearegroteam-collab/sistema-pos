@@ -11,6 +11,12 @@ function passwordUrl(type: string) {
   return `/set-password?type=${encodeURIComponent(type)}`;
 }
 
+function requirePasswordSetup(type: string) {
+  if (type === "invite" || type === "recovery") {
+    window.sessionStorage.setItem("require_password_setup", "true");
+  }
+}
+
 function readableAuthError(error?: { message?: string } | null) {
   const message = error?.message?.toLowerCase() ?? "";
   if (message.includes("expired") || message.includes("invalid") || message.includes("otp")) {
@@ -54,6 +60,7 @@ export default function AuthCallbackPage() {
             refresh_token: refreshToken
           });
           if (sessionError) throw sessionError;
+          requirePasswordSetup(type);
           window.location.replace(passwordUrl(type));
           return;
         }
@@ -62,12 +69,14 @@ export default function AuthCallbackPage() {
         if (code) {
           const { error: codeError } = await supabase.auth.exchangeCodeForSession(code);
           if (codeError) throw codeError;
+          requirePasswordSetup(type);
           window.location.replace(passwordUrl(type));
           return;
         }
 
         const { data } = await supabase.auth.getSession();
         if (data.session) {
+          requirePasswordSetup(type);
           window.location.replace(passwordUrl(type));
           return;
         }

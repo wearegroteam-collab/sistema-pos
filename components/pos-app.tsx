@@ -462,6 +462,13 @@ export function PosApp() {
   const isSupportMode = role === "super_admin" && Boolean(supportBusinessId);
 
   useEffect(() => {
+    if (initialPath === "/set-password") return;
+    if (window.sessionStorage.getItem("require_password_setup") === "true") {
+      window.location.replace("/set-password");
+    }
+  }, [initialPath]);
+
+  useEffect(() => {
     const saved = window.localStorage.getItem("simple-pos-state");
     if (!saved) return;
     const parsed = JSON.parse(saved);
@@ -790,6 +797,7 @@ export function PosApp() {
 
   async function handleLogout() {
     if (supabase) await supabase.auth.signOut();
+    window.sessionStorage.removeItem("require_password_setup");
     setSession(null);
     setRole("admin");
     setActiveBusinessId(initialBusiness.id);
@@ -816,6 +824,13 @@ export function PosApp() {
   function exitSupportMode() {
     setSupportBusinessId(null);
     setActiveBusinessId(initialBusiness.id);
+  }
+
+  const passwordSetupRequired = typeof window !== "undefined" && initialPath !== "/set-password" && window.sessionStorage.getItem("require_password_setup") === "true";
+
+  if (passwordSetupRequired) {
+    window.location.replace("/set-password");
+    return <main className="grid min-h-screen place-items-center bg-surface p-4"><section className="rounded-md border border-line bg-white p-6 text-center shadow-soft"><h1 className="text-xl font-black">Redirigiendo para crear contrasena...</h1></section></main>;
   }
 
   if (authLoading && !session) {
