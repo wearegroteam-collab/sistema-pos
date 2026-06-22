@@ -12,6 +12,7 @@ import {
   CreditCard,
   Eye,
   Home,
+  LayoutDashboard,
   Link2,
   LogIn,
   Minus,
@@ -56,13 +57,13 @@ import { printService } from "@/lib/printing/printService";
 
 const now = () => new Date().toISOString();
 const money = new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 });
-type MainTab = "mesas" | "menu" | "ordenes" | "reportes" | "ajustes";
+type MainTab = "dashboard" | "vender" | "ventas" | "menu" | "reportes" | "ajustes";
 type SuperAdminTab = "businesses" | "invitations" | "checklist";
 type BusinessFilter = "all" | "real" | "demo" | "active" | "inactive" | "deleted";
 type MenuTab = "categorias" | "productos" | "adiciones" | "vinculos";
 type SettingsTab = "negocio" | "recibo" | "comanda" | "pagos" | "usuarios" | "impresion" | "cobro";
-type PrintMode = "comanda" | "recibo" | "detalle" | null;
-type DatePreset = "hoy" | "ayer" | "semana" | "mes" | "rango";
+type PrintMode = "comanda" | "precuenta" | "recibo" | "detalle" | null;
+type DatePreset = "hoy" | "ayer" | "semana" | "mes" | "anio" | "rango";
 
 const permissionLabels: Record<keyof CashierPermissions, string> = {
   viewTables: "Ver mesas",
@@ -268,6 +269,7 @@ function getPresetRange(preset: DatePreset) {
     return { from: toDateInput(start), to: toDateInput(today) };
   }
   if (preset === "mes") return { from: toDateInput(new Date(today.getFullYear(), today.getMonth(), 1)), to: toDateInput(today) };
+  if (preset === "anio") return { from: toDateInput(new Date(today.getFullYear(), 0, 1)), to: toDateInput(today) };
   return { from: toDateInput(today), to: toDateInput(today) };
 }
 
@@ -281,6 +283,7 @@ function inDateRange(value: string, from?: string, to?: string) {
 function normalizeOrders(orders: Order[]) {
   return orders.map((order) => ({
     ...order,
+    status: String(order.status) === "en_cocina" ? "comandada" : order.status,
     cashier: order.cashier ?? "Sistema",
     audit: order.audit ?? [],
     items: order.items.map((item) => ({ ...item, additions: item.additions ?? [] }))
@@ -442,7 +445,7 @@ export function PosApp() {
   const [activeOrderId, setActiveOrderId] = useState<string | null>(null);
   const [printMode, setPrintMode] = useState<PrintMode>(null);
   const [showCloseShift, setShowCloseShift] = useState(false);
-  const [tab, setTab] = useState<MainTab>(initialPath.includes("reports") ? "reportes" : initialPath.includes("orders") ? "ordenes" : initialPath.includes("settings") || initialPath.includes("admin") ? "ajustes" : "mesas");
+  const [tab, setTab] = useState<MainTab>(initialPath.includes("reports") ? "reportes" : initialPath.includes("orders") ? "ventas" : initialPath.includes("settings") || initialPath.includes("admin") ? "ajustes" : initialPath.includes("mesas") ? "vender" : "dashboard");
   const [role, setRole] = useState<Role>("admin");
   const [session, setSession] = useState<{ email: string; userId?: string } | null>(null);
   const [login, setLogin] = useState({ email: "", password: "" });
@@ -531,6 +534,7 @@ export function PosApp() {
   const businessTables = tables.filter((item) => (item.businessId ?? activeBusinessId) === activeBusinessId);
   const businessOrders = orders.filter((item) => (item.businessId ?? activeBusinessId) === activeBusinessId);
   const activeOrder = orders.find((order) => order.id === activeOrderId) ?? null;
+  const openBusinessOrders = businessOrders.filter((order) => !["pagada", "cancelada", "anulada"].includes(order.status));
   const orderedTables = useMemo(() => [...businessTables].sort((a, b) => a.sortOrder - b.sortOrder), [businessTables]);
 
   function updateOrder(orderId: string, updater: (order: Order) => Order) {
@@ -597,9 +601,14 @@ export function PosApp() {
   function confirmKitchen(order: Order) {
     if (!can("confirmKitchen")) return;
     if (!activeShift && !currentBusiness.testMode) return;
-    updateOrder(order.id, (current) => ({ ...current, status: "en_cocina", audit: [...current.audit, audit(currentUser, "Orden confirmada y comanda generada")] }));
-    if (order.tableId) setTables((current) => current.map((table) => (table.id === order.tableId ? { ...table, status: "esperando_pago" } : table)));
+    updateOrder(order.id, (current) => ({ ...current, status: "comandada", audit: [...current.audit, audit(currentUser, "Orden confirmada y comanda generada")] }));
     setPrintMode("comanda");
+  }
+
+  function printPrecheck(order: Order) {
+    updateOrder(order.id, (current) => ({ ...current, status: ["pagada", "cancelada", "anulada"].includes(current.status) ? current.status : "esperando_pago", audit: [...current.audit, audit(currentUser, "Precuenta generada")] }));
+    if (order.tableId) setTables((current) => current.map((table) => (table.id === order.tableId ? { ...table, status: "esperando_pago" } : table)));
+    setPrintMode("precuenta");
   }
 
   function closeOrder(order: Order, method: PaymentMethod) {
@@ -792,7 +801,7 @@ export function PosApp() {
     if (role !== "super_admin") return;
     setActiveBusinessId(businessId);
     setSupportBusinessId(businessId);
-    setTab("mesas");
+    setTab("vender");
     if (supabase && session?.userId) {
       await supabase.from("audit_logs").insert({
         business_id: businessId,
@@ -887,18 +896,20 @@ export function PosApp() {
 
       <div className="no-print sticky top-0 z-10 border-b border-line bg-white">
         <nav className="mx-auto flex max-w-7xl gap-2 overflow-x-auto px-4 py-3">
-          {can("viewTables") && <TabButton icon={<Home size={18} />} label="Mesas" tab="mesas" current={tab} onClick={setTab} />}
+          {can("viewTables") && <TabButton icon={<LayoutDashboard size={18} />} label="Dashboard" tab="dashboard" current={tab} onClick={setTab} />}
+          {can("viewTables") && <TabButton icon={<Home size={18} />} label="Vender" tab="vender" current={tab} onClick={setTab} />}
+          {can("viewOrders") && <TabButton icon={<ShoppingBag size={18} />} label="Ventas" tab="ventas" current={tab} onClick={setTab} />}
           {can("modifyMenu") && <TabButton icon={<Utensils size={18} />} label="Menu" tab="menu" current={tab} onClick={setTab} />}
-          {can("viewOrders") && <TabButton icon={<ShoppingBag size={18} />} label="Ordenes" tab="ordenes" current={tab} onClick={setTab} />}
           {can("viewReports") && <TabButton icon={<BarChart3 size={18} />} label="Reportes" tab="reportes" current={tab} onClick={setTab} />}
           {can("modifySettings") && <TabButton icon={<Settings size={18} />} label="Ajustes" tab="ajustes" current={tab} onClick={setTab} />}
         </nav>
       </div>
 
       <section className="mx-auto max-w-7xl px-4 py-5">
-        {tab === "mesas" && (can("viewTables") ? <TablesView role={role} tables={orderedTables} setTables={setTables} activeBusinessId={activeBusinessId} activeShift={activeShift} testMode={currentBusiness.testMode} canOpenShift={can("openShift")} openShift={openShift} openOrderForTable={openOrderForTable} createDirectOrder={createDirectOrder} /> : <NoPermission />)}
+        {tab === "dashboard" && (can("viewTables") ? <DashboardView orders={businessOrders} products={businessProducts} /> : <NoPermission />)}
+        {tab === "vender" && (can("viewTables") ? <TablesView role={role} tables={orderedTables} openOrders={openBusinessOrders} setTables={setTables} activeBusinessId={activeBusinessId} activeShift={activeShift} testMode={currentBusiness.testMode} canOpenShift={can("openShift")} openShift={openShift} openOrderForTable={openOrderForTable} createDirectOrder={createDirectOrder} openExistingOrder={setActiveOrderId} /> : <NoPermission />)}
+        {tab === "ventas" && (can("viewOrders") ? <SalesView orders={businessOrders} shifts={shifts.filter((shift) => (shift.businessId ?? activeBusinessId) === activeBusinessId)} setActiveOrderId={setActiveOrderId} setPrintMode={setPrintMode} /> : <NoPermission />)}
         {tab === "menu" && (can("modifyMenu") ? <MenuManager canEdit={can("modifyMenu")} activeBusinessId={activeBusinessId} categories={businessCategories} setCategories={setCategories} products={businessProducts} setProducts={setProducts} additions={businessAdditions} setAdditions={setAdditions} /> : <NoPermission />)}
-        {tab === "ordenes" && (can("viewOrders") ? <OrdersHistory orders={businessOrders} setActiveOrderId={setActiveOrderId} setPrintMode={setPrintMode} /> : <NoPermission />)}
         {tab === "reportes" && (can("viewReports") ? <ReportsView orders={businessOrders.filter((order) => order.status === "pagada")} shifts={shifts.filter((shift) => (shift.businessId ?? activeBusinessId) === activeBusinessId)} /> : <NoPermission />)}
         {tab === "ajustes" && (can("modifySettings") ? <SettingsView business={currentBusiness} setBusiness={(updater) => setBusinesses((current) => current.map((item) => item.id === activeBusinessId ? (typeof updater === "function" ? updater(item) : updater) : item))} settings={settings} setSettings={setSettings} users={businessUsers.filter((user) => user.businessId === activeBusinessId)} setUsers={setBusinessUsers} invitations={invitations.filter((invitation) => invitation.businessId === activeBusinessId)} setInvitations={setInvitations} activeBusinessId={activeBusinessId} currentUser={currentUser} /> : <NoPermission />)}
       </section>
@@ -922,6 +933,7 @@ export function PosApp() {
           updateOrder={updateOrder}
           appendAudit={appendAudit}
           confirmKitchen={confirmKitchen}
+          printPrecheck={printPrecheck}
           closeOrder={closeOrder}
           cancelOrder={cancelOrder}
         />
@@ -937,6 +949,75 @@ function TabButton({ icon, label, tab, current, onClick, disabled }: { icon: Rea
     <button disabled={disabled} className={`flex min-h-11 shrink-0 items-center gap-2 rounded-md border px-4 py-2 font-semibold disabled:opacity-40 ${active ? "border-brand bg-brand text-white" : "border-line bg-white text-ink"}`} onClick={() => onClick(tab)}>
       {icon}{label}
     </button>
+  );
+}
+
+function DashboardView({ orders, products }: { orders: Order[]; products: Product[] }) {
+  const realPaid = orders.filter((order) => order.status === "pagada" && !order.testMode);
+  const today = getPresetRange("hoy");
+  const week = getPresetRange("semana");
+  const month = getPresetRange("mes");
+  const year = getPresetRange("anio");
+  const totalFor = (range: { from: string; to: string }) => realPaid.filter((order) => inDateRange(order.closedAt ?? order.createdAt, range.from, range.to)).reduce((sum, order) => sum + order.total, 0);
+  const last7Days = Array.from({ length: 7 }, (_, index) => {
+    const day = startOfDay(new Date());
+    day.setDate(day.getDate() - (6 - index));
+    const key = toDateInput(day);
+    const total = realPaid.filter((order) => inDateRange(order.closedAt ?? order.createdAt, key, key)).reduce((sum, order) => sum + order.total, 0);
+    return { key, label: day.toLocaleDateString("es-CO", { weekday: "short", timeZone: "America/Bogota" }), total };
+  });
+  const maxDay = Math.max(1, ...last7Days.map((day) => day.total));
+  const monthOrders = realPaid.filter((order) => inDateRange(order.closedAt ?? order.createdAt, month.from, month.to));
+  const topProducts = Object.entries(monthOrders.flatMap((order) => order.items).reduce<Record<string, number>>((acc, item) => ({ ...acc, [item.productName]: (acc[item.productName] ?? 0) + item.quantity }), {})).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const knownProducts = products.length;
+
+  return (
+    <div className="space-y-5">
+      <section className="rounded-md border border-line bg-white p-4 shadow-soft">
+        <h1 className="text-2xl font-black">Dashboard</h1>
+        <p className="mt-1 text-sm text-slate-600">Vision rapida del negocio con datos reales. Los datos de prueba no se incluyen.</p>
+      </section>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <Metric title="Ventas del dia" value={money.format(totalFor(today))} />
+        <Metric title="Ventas de la semana" value={money.format(totalFor(week))} />
+        <Metric title="Ventas del mes" value={money.format(totalFor(month))} />
+        <Metric title="Ventas del ano" value={money.format(totalFor(year))} />
+      </div>
+      <div className="grid gap-5 lg:grid-cols-[1.25fr_0.75fr]">
+        <section className="rounded-md border border-line bg-white p-4 shadow-soft">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-xl font-bold">Facturacion ultimos 7 dias</h2>
+            <span className="rounded-md bg-surface px-3 py-2 text-sm font-bold">{realPaid.length} ventas reales</span>
+          </div>
+          <div className="mt-5 flex h-64 items-end gap-3">
+            {last7Days.map((day) => (
+              <div key={day.key} className="flex min-w-0 flex-1 flex-col items-center gap-2">
+                <div className="flex h-48 w-full items-end rounded-md bg-surface p-1">
+                  <div className="w-full rounded-md bg-brand" style={{ height: `${Math.max(6, (day.total / maxDay) * 100)}%` }} />
+                </div>
+                <span className="text-xs font-bold uppercase">{day.label}</span>
+                <span className="text-xs text-slate-600">{money.format(day.total)}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+        <section className="rounded-md border border-line bg-white p-4 shadow-soft">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-xl font-bold">Top 5 productos del mes</h2>
+            <span className="rounded-md bg-surface px-3 py-2 text-sm font-bold">{knownProducts} productos</span>
+          </div>
+          <div className="mt-4 space-y-3">
+            {topProducts.length === 0 && <p className="rounded-md bg-surface p-3 text-sm text-slate-600">Sin productos vendidos este mes.</p>}
+            {topProducts.map(([name, quantity], index) => (
+              <div key={name} className="rounded-md bg-surface p-3">
+                <div className="flex justify-between gap-3 font-bold"><span>{index + 1}. {name}</span><span>{quantity}</span></div>
+                <div className="mt-2 h-2 rounded-full bg-white"><div className="h-2 rounded-full bg-accent" style={{ width: `${Math.max(8, (quantity / Math.max(1, topProducts[0]?.[1] ?? 1)) * 100)}%` }} /></div>
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
+    </div>
   );
 }
 
@@ -1243,7 +1324,7 @@ function InnerTabs<T extends string>({ tabs, current, onChange }: { tabs: { id: 
   );
 }
 
-function TablesView({ role, tables, setTables, activeBusinessId, activeShift, testMode, canOpenShift, openShift, openOrderForTable, createDirectOrder }: { role: Role; tables: RestaurantTable[]; setTables: React.Dispatch<React.SetStateAction<RestaurantTable[]>>; activeBusinessId: string; activeShift: CashShift | null; testMode: boolean; canOpenShift: boolean; openShift: (openingAmount: number, openingNote?: string) => void; openOrderForTable: (table: RestaurantTable) => void; createDirectOrder: (type: Exclude<OrderType, "mesa">) => void }) {
+function TablesView({ role, tables, openOrders, setTables, activeBusinessId, activeShift, testMode, canOpenShift, openShift, openOrderForTable, createDirectOrder, openExistingOrder }: { role: Role; tables: RestaurantTable[]; openOrders: Order[]; setTables: React.Dispatch<React.SetStateAction<RestaurantTable[]>>; activeBusinessId: string; activeShift: CashShift | null; testMode: boolean; canOpenShift: boolean; openShift: (openingAmount: number, openingNote?: string) => void; openOrderForTable: (table: RestaurantTable) => void; createDirectOrder: (type: Exclude<OrderType, "mesa">) => void; openExistingOrder: (orderId: string) => void }) {
   const [configMode, setConfigMode] = useState(false);
   const [name, setName] = useState("");
   const [showOpenShift, setShowOpenShift] = useState(false);
@@ -1274,7 +1355,7 @@ function TablesView({ role, tables, setTables, activeBusinessId, activeShift, te
   return (
     <div className="space-y-5">
       <div className="flex flex-col gap-3 rounded-md border border-line bg-white p-4 shadow-soft lg:flex-row lg:items-end lg:justify-between">
-        <div><h1 className="text-2xl font-bold">Mapa de mesas</h1><p className="mt-1 text-sm text-slate-600">Operacion diaria desde mesas, pickup o delivery.</p></div>
+        <div><h1 className="text-2xl font-bold">Vender</h1><p className="mt-1 text-sm text-slate-600">Operacion diaria desde mesas, pickup, delivery y ordenes abiertas.</p></div>
         <div className="flex flex-wrap gap-2">
           <button className="flex min-h-12 items-center gap-2 rounded-md bg-accent px-4 py-2 font-bold text-white" onClick={() => tryCreateOrder("pickup")}><ShoppingBag size={20} /> Pickup</button>
           <button className="flex min-h-12 items-center gap-2 rounded-md bg-ink px-4 py-2 font-bold text-white" onClick={() => tryCreateOrder("delivery")}><PackagePlus size={20} /> Delivery</button>
@@ -1283,6 +1364,25 @@ function TablesView({ role, tables, setTables, activeBusinessId, activeShift, te
       </div>
       {!canSell && <div className="rounded-md border border-yellow-200 bg-yellow-50 p-4 text-yellow-900"><div className="flex flex-wrap items-center justify-between gap-3"><p className="font-bold">No hay turno abierto. Abre turno para comenzar a vender.</p><button disabled={!canOpenShift} className="rounded-md bg-ink px-4 py-2 font-bold text-white disabled:opacity-40" onClick={() => setShowOpenShift(true)}>Abrir turno</button></div></div>}
       {showOpenShift && <div className="rounded-md border border-line bg-white p-4 shadow-soft"><OpenShiftPanel cashier="Caja" onOpen={(amount, note) => { openShift(amount, note); setShowOpenShift(false); }} /></div>}
+      {openOrders.length > 0 && (
+        <section className="rounded-md border border-line bg-white p-4 shadow-soft">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-xl font-bold">Ordenes abiertas</h2>
+            <span className="rounded-md bg-surface px-3 py-2 text-sm font-bold">{openOrders.length} activas</span>
+          </div>
+          <div className="mt-3 grid gap-2 md:grid-cols-2 lg:grid-cols-3">
+            {openOrders.map((order) => (
+              <button key={order.id} className="rounded-md border border-line bg-surface p-3 text-left hover:border-brand" onClick={() => openExistingOrder(order.id)}>
+                <div className="flex items-start justify-between gap-3">
+                  <div><p className="font-black">Orden #{order.number}</p><p className="text-sm text-slate-600">{order.tableName ?? order.type}</p></div>
+                  <span className="rounded-md bg-white px-2 py-1 text-xs font-bold">{order.status.replace("_", " ")}</span>
+                </div>
+                <p className="mt-3 text-lg font-black text-brand">{money.format(order.total)}</p>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
       {configMode && (
         <div className="grid gap-3 rounded-md border border-line bg-white p-4 shadow-soft sm:grid-cols-[1fr_auto]">
           <input className="min-h-12 rounded-md border border-line px-3" placeholder="Nombre o numero de mesa" value={name} onChange={(event) => setName(event.target.value)} />
@@ -1408,7 +1508,7 @@ function ExtraLinks({ canEdit, products, additions, setAdditions }: { canEdit: b
   );
 }
 
-function OrderDrawer({ business, settings, activeShift, role, can, currentUser, order, categories, products, additions, printMode, setPrintMode, onClose, addProduct, updateOrder, appendAudit, confirmKitchen, closeOrder, cancelOrder }: { business: Business; settings: AppSettings; activeShift: CashShift | null; role: Role; can: (permission: keyof CashierPermissions) => boolean; currentUser: string; order: Order; categories: Category[]; products: Product[]; additions: Addition[]; printMode: PrintMode; setPrintMode: (mode: PrintMode) => void; onClose: () => void; addProduct: (product: Product) => void; updateOrder: (orderId: string, updater: (order: Order) => Order) => void; appendAudit: (orderId: string, action: string, reason?: string) => void; confirmKitchen: (order: Order) => void; closeOrder: (order: Order, method: PaymentMethod) => void; cancelOrder: (order: Order, reason: string) => void }) {
+function OrderDrawer({ business, settings, activeShift, role, can, currentUser, order, categories, products, additions, printMode, setPrintMode, onClose, addProduct, updateOrder, appendAudit, confirmKitchen, printPrecheck, closeOrder, cancelOrder }: { business: Business; settings: AppSettings; activeShift: CashShift | null; role: Role; can: (permission: keyof CashierPermissions) => boolean; currentUser: string; order: Order; categories: Category[]; products: Product[]; additions: Addition[]; printMode: PrintMode; setPrintMode: (mode: PrintMode) => void; onClose: () => void; addProduct: (product: Product) => void; updateOrder: (orderId: string, updater: (order: Order) => Order) => void; appendAudit: (orderId: string, action: string, reason?: string) => void; confirmKitchen: (order: Order) => void; printPrecheck: (order: Order) => void; closeOrder: (order: Order, method: PaymentMethod) => void; cancelOrder: (order: Order, reason: string) => void }) {
   const [search, setSearch] = useState("");
   const [categoryId, setCategoryId] = useState("all");
   const [paying, setPaying] = useState(false);
@@ -1422,6 +1522,7 @@ function OrderDrawer({ business, settings, activeShift, role, can, currentUser, 
           <div><h2 className="text-2xl font-black">Orden #{order.number}</h2><p className="text-sm text-slate-600">{order.tableName ?? order.type} · {order.status.replace("_", " ")} · {order.cashier}</p></div>
           <div className="flex flex-wrap gap-2">
             <button disabled={!order.items.length || !canEdit || !can("confirmKitchen")} className="flex min-h-11 items-center gap-2 rounded-md bg-brand px-4 font-bold text-white disabled:bg-slate-400" onClick={() => confirmKitchen(order)}><ChefHat size={18} /> Confirmar</button>
+            <button disabled={!order.items.length || !canEdit} className="flex min-h-11 items-center gap-2 rounded-md border border-line bg-white px-4 font-bold disabled:opacity-40" onClick={() => printPrecheck(order)}><Printer size={18} /> Precuenta</button>
             <button disabled={!activeShift || !order.items.length || !canEdit || !can("chargeOrders")} className="flex min-h-11 items-center gap-2 rounded-md bg-accent px-4 font-bold text-white disabled:bg-slate-400" onClick={() => setPaying((value) => !value)}><Banknote size={18} /> Cobrar</button>
             <IconButton title="Cerrar" onClick={onClose}><X size={20} /></IconButton>
           </div>
@@ -1437,7 +1538,7 @@ function OrderDrawer({ business, settings, activeShift, role, can, currentUser, 
             </div>
             <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
               {filteredProducts.map((product) => (
-                <button disabled={!canEdit || (order.status === "en_cocina" && !can("editAfterKitchen"))} key={product.id} className="min-h-28 rounded-md border border-line bg-surface p-4 text-left hover:border-brand disabled:opacity-50" onClick={() => addProduct(product)}>
+                <button disabled={!canEdit || ((order.status === "comandada" || order.status === "esperando_pago") && !can("editAfterKitchen"))} key={product.id} className="min-h-28 rounded-md border border-line bg-surface p-4 text-left hover:border-brand disabled:opacity-50" onClick={() => addProduct(product)}>
                   <div className="flex items-start justify-between gap-2"><span className="text-lg font-bold">{product.name}</span><span className="font-bold text-brand">{money.format(product.price)}</span></div>
                   <p className="mt-2 text-sm text-slate-600">{product.description}</p>
                 </button>
@@ -1469,7 +1570,8 @@ function OrderDrawer({ business, settings, activeShift, role, can, currentUser, 
 }
 
 function OrderItemEditor({ currentUser, order, item, additions, updateOrder, appendAudit, disabled, canRemove, canEditAfterKitchen, requestReason }: { currentUser: string; order: Order; item: OrderItem; additions: Addition[]; updateOrder: (orderId: string, updater: (order: Order) => Order) => void; appendAudit: (orderId: string, action: string, reason?: string) => void; disabled: boolean; canRemove: boolean; canEditAfterKitchen: boolean; tipEnabled?: boolean; requestReason: () => void }) {
-  const locked = order.status === "en_cocina" && !canEditAfterKitchen;
+  const needsKitchenReason = order.status === "comandada" || order.status === "esperando_pago";
+  const locked = needsKitchenReason && !canEditAfterKitchen;
   const changeQty = (quantity: number) => updateOrder(order.id, (current) => ({ ...current, items: current.items.map((row) => row.id === item.id ? { ...row, quantity: Math.max(1, quantity) } : row), audit: [...current.audit, audit(currentUser, `Cantidad modificada: ${item.productName}`)] }));
   const toggleAddition = (addition: Addition) => updateOrder(order.id, (current) => ({ ...current, items: current.items.map((row) => {
     if (row.id !== item.id) return row;
@@ -1492,7 +1594,7 @@ function OrderItemEditor({ currentUser, order, item, additions, updateOrder, app
         return <button disabled={disabled || locked} key={addition.id} className={`rounded-md border px-3 py-2 text-sm font-semibold disabled:opacity-50 ${selected ? "border-brand bg-emerald-50 text-brand" : "border-line bg-surface"}`} onClick={() => toggleAddition(addition)}>{addition.name} +{money.format(addition.price)}</button>;
       })}</div>}
       <textarea disabled={disabled || locked} className="mt-3 min-h-20 w-full rounded-md border border-line p-2 disabled:bg-slate-100" placeholder="Nota: sin cebolla, extra queso..." value={item.notes ?? ""} onChange={(event) => updateOrder(order.id, (current) => ({ ...current, items: current.items.map((row) => row.id === item.id ? { ...row, notes: event.target.value } : row), audit: [...current.audit, audit(currentUser, `Nota modificada: ${item.productName}`)] }))} />
-      <button disabled={disabled || !canRemove} className="mt-2 flex min-h-10 items-center gap-2 rounded-md border border-line px-3 font-semibold disabled:opacity-40" onClick={() => order.status === "en_cocina" ? requestReason() : updateOrder(order.id, (current) => ({ ...current, items: current.items.filter((row) => row.id !== item.id), audit: [...current.audit, audit(currentUser, `Producto eliminado: ${item.productName}`)] }))}><Trash2 size={16} /> Quitar</button>
+      <button disabled={disabled || !canRemove} className="mt-2 flex min-h-10 items-center gap-2 rounded-md border border-line px-3 font-semibold disabled:opacity-40" onClick={() => needsKitchenReason ? requestReason() : updateOrder(order.id, (current) => ({ ...current, items: current.items.filter((row) => row.id !== item.id), audit: [...current.audit, audit(currentUser, `Producto eliminado: ${item.productName}`)] }))}><Trash2 size={16} /> Quitar</button>
     </article>
   );
 }
@@ -1527,6 +1629,58 @@ function PaymentBox({ settings, order, updateOrder, closeOrder }: { settings: Ap
   );
 }
 
+function SalesView({ orders, shifts, setActiveOrderId, setPrintMode }: { orders: Order[]; shifts: CashShift[]; setActiveOrderId: (id: string) => void; setPrintMode: (mode: PrintMode) => void }) {
+  const [tab, setTab] = useState<"cuadres" | "pedidos" | "recibos">("cuadres");
+  const paidOrders = orders.filter((order) => order.status === "pagada");
+  return (
+    <div className="space-y-4">
+      <section className="rounded-md border border-line bg-white p-4 shadow-soft">
+        <h1 className="text-2xl font-black">Ventas</h1>
+        <p className="mt-1 text-sm text-slate-600">Historial, cuadres de caja y documentos finales. La toma de pedidos vive en Vender.</p>
+        <InnerTabs current={tab} onChange={setTab} tabs={[
+          { id: "cuadres", label: "Cuadres de caja" },
+          { id: "pedidos", label: "Pedidos" },
+          { id: "recibos", label: "Facturas finales / Recibos" }
+        ]} />
+      </section>
+      {tab === "cuadres" && <ShiftHistory shifts={shifts} orders={orders} />}
+      {tab === "pedidos" && <OrdersHistory orders={orders} setActiveOrderId={setActiveOrderId} setPrintMode={setPrintMode} />}
+      {tab === "recibos" && <ReceiptsHistory orders={paidOrders} setActiveOrderId={setActiveOrderId} setPrintMode={setPrintMode} />}
+    </div>
+  );
+}
+
+function ReceiptsHistory({ orders, setActiveOrderId, setPrintMode }: { orders: Order[]; setActiveOrderId: (id: string) => void; setPrintMode: (mode: PrintMode) => void }) {
+  const [preset, setPreset] = useState<DatePreset>("hoy");
+  const [range, setRange] = useState(getPresetRange("hoy"));
+  const activeRange = preset === "rango" ? range : getPresetRange(preset);
+  const filtered = orders.filter((order) => inDateRange(order.closedAt ?? order.createdAt, activeRange.from, activeRange.to));
+  return (
+    <div className="space-y-4">
+      <section className="rounded-md border border-line bg-white p-4 shadow-soft">
+        <h2 className="text-xl font-bold">Facturas finales / Recibos</h2>
+        <DatePresetButtons preset={preset} setPreset={setPreset} />
+        {preset === "rango" && <DateRangeInputs range={range} setRange={setRange} />}
+      </section>
+      <section className="overflow-x-auto rounded-md border border-line bg-white shadow-soft">
+        <table className="w-full min-w-[860px] border-collapse text-sm">
+          <thead className="bg-surface text-left"><tr>{["Recibo", "Fecha", "Cliente", "Mesa/tipo", "Total", "Metodo", ""].map((head) => <th key={head} className="p-3">{head}</th>)}</tr></thead>
+          <tbody>{filtered.map((order) => <tr key={order.id} className="border-t border-line">
+            <td className="p-3 font-bold">R-{String(order.number).padStart(5, "0")}</td>
+            <td className="p-3">{formatDateTime(order.closedAt ?? order.createdAt)}</td>
+            <td className="p-3">-</td>
+            <td className="p-3">{order.tableName ?? order.type}</td>
+            <td className="p-3 font-bold">{money.format(order.total)}</td>
+            <td className="p-3">{order.paymentMethod ?? "-"}</td>
+            <td className="p-3"><button className="min-h-10 rounded-md border border-line px-3 font-bold" onClick={() => { setActiveOrderId(order.id); setPrintMode("recibo"); }}>Reimprimir recibo</button></td>
+          </tr>)}</tbody>
+        </table>
+        {filtered.length === 0 && <p className="p-4 text-sm text-slate-600">Sin recibos en este periodo.</p>}
+      </section>
+    </div>
+  );
+}
+
 function OrdersHistory({ orders, setActiveOrderId, setPrintMode }: { orders: Order[]; setActiveOrderId: (id: string) => void; setPrintMode: (mode: PrintMode) => void }) {
   const [preset, setPreset] = useState<DatePreset>("hoy");
   const today = getPresetRange("hoy");
@@ -1539,11 +1693,11 @@ function OrdersHistory({ orders, setActiveOrderId, setPrintMode }: { orders: Ord
       <section className="rounded-md border border-line bg-white p-4 shadow-soft">
         <h1 className="text-2xl font-bold">Historial de ordenes</h1>
         <div className="mt-4 flex flex-wrap gap-2">
-          {(["hoy", "ayer", "semana", "mes", "rango"] as DatePreset[]).map((value) => <button key={value} className={`min-h-11 rounded-md border px-4 font-bold ${preset === value ? "border-brand bg-brand text-white" : "border-line bg-white"}`} onClick={() => setPreset(value)}>{value === "semana" ? "Esta semana" : value === "mes" ? "Este mes" : value === "rango" ? "Rango personalizado" : value}</button>)}
+          {(["hoy", "ayer", "semana", "mes", "anio", "rango"] as DatePreset[]).map((value) => <button key={value} className={`min-h-11 rounded-md border px-4 font-bold ${preset === value ? "border-brand bg-brand text-white" : "border-line bg-white"}`} onClick={() => setPreset(value)}>{presetLabel(value)}</button>)}
         </div>
         <div className="mt-3 grid gap-3 md:grid-cols-5">
           {preset === "rango" ? <><input className="min-h-11 rounded-md border border-line px-3" type="date" value={range.from} onChange={(event) => setRange({ ...range, from: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" type="date" value={range.to} onChange={(event) => setRange({ ...range, to: event.target.value })} /></> : <div className="rounded-md bg-surface px-3 py-3 text-sm font-bold md:col-span-2">{activeRange.from} / {activeRange.to}</div>}
-          <select className="min-h-11 rounded-md border border-line px-3" value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}><option value="all">Todos los estados</option>{(["abierta", "en_cocina", "pagada", "cancelada", "anulada"] as OrderStatus[]).map((status) => <option key={status} value={status}>{status}</option>)}</select>
+          <select className="min-h-11 rounded-md border border-line px-3" value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}><option value="all">Todos los estados</option>{(["abierta", "comandada", "esperando_pago", "pagada", "cancelada"] as OrderStatus[]).map((status) => <option key={status} value={status}>{status.replace("_", " ")}</option>)}</select>
           <select className="min-h-11 rounded-md border border-line px-3" value={filters.type} onChange={(event) => setFilters({ ...filters, type: event.target.value })}><option value="all">Todos los tipos</option><option value="mesa">Mesa</option><option value="pickup">Pickup</option><option value="delivery">Delivery</option></select>
           <select className="min-h-11 rounded-md border border-line px-3" value={filters.method} onChange={(event) => setFilters({ ...filters, method: event.target.value })}><option value="all">Todos los pagos</option>{["efectivo", "tarjeta", "transferencia", "ATH", "Zelle", "otro"].map((method) => <option key={method} value={method}>{method}</option>)}</select>
         </div>
@@ -1553,7 +1707,7 @@ function OrdersHistory({ orders, setActiveOrderId, setPrintMode }: { orders: Ord
           <thead className="bg-surface text-left"><tr>{["Orden", "Fecha/hora", "Mesa/tipo", "Estado", "Total", "Metodo", "Usuario", ""].map((head) => <th key={head} className="p-3">{head}</th>)}</tr></thead>
           <tbody>{filtered.map((order) => <tr key={order.id} className="border-t border-line">
             <td className="p-3 font-bold">#{order.number}</td><td className="p-3">{formatDateTime(order.createdAt)}</td><td className="p-3">{order.tableName ?? order.type}</td><td className="p-3">{order.status.replace("_", " ")}</td><td className="p-3 font-bold">{money.format(order.total)}</td><td className="p-3">{order.paymentMethod ?? "-"}</td><td className="p-3">{order.cashier ?? "-"}</td>
-            <td className="p-3"><IconButton title="Ver detalle" onClick={() => { setActiveOrderId(order.id); setPrintMode("detalle"); }}><Eye size={18} /></IconButton></td>
+            <td className="p-3"><div className="flex gap-2"><IconButton title="Ver detalle" onClick={() => { setActiveOrderId(order.id); setPrintMode("detalle"); }}><Eye size={18} /></IconButton><IconButton title="Reimprimir comanda" onClick={() => { setActiveOrderId(order.id); setPrintMode("comanda"); }}><ChefHat size={18} /></IconButton><IconButton title="Reimprimir precuenta" onClick={() => { setActiveOrderId(order.id); setPrintMode("precuenta"); }}><Printer size={18} /></IconButton>{order.status === "pagada" && <IconButton title="Reimprimir recibo" onClick={() => { setActiveOrderId(order.id); setPrintMode("recibo"); }}><ReceiptText size={18} /></IconButton>}</div></td>
           </tr>)}</tbody>
         </table>
       </section>
@@ -1699,17 +1853,19 @@ function ReportsView({ orders, shifts }: { orders: Order[]; shifts: CashShift[] 
 
 function PrintModal({ business, settings, order, mode, role, onClose, onPrint }: { business: Business; settings: AppSettings; order: Order; mode: Exclude<PrintMode, null>; role: Role; onClose: () => void; onPrint: (label: string) => void }) {
   const isKitchen = mode === "comanda";
-  return <div className="fixed inset-0 z-40 grid place-items-center bg-ink/50 p-4"><div className="w-full max-w-md"><TicketShell title={isKitchen ? "Comanda de cocina" : mode === "detalle" ? "Detalle de orden" : settings.receipt.businessName} size={isKitchen ? settings.kitchen.size : settings.receipt.size}>
+  const isPrecheck = mode === "precuenta";
+  return <div className="fixed inset-0 z-40 grid place-items-center bg-ink/50 p-4"><div className="w-full max-w-md"><TicketShell title={isKitchen ? "Comanda de cocina" : isPrecheck ? "Precuenta" : mode === "detalle" ? "Detalle de orden" : settings.receipt.businessName} size={isKitchen ? settings.kitchen.size : settings.receipt.size}>
     {!isKitchen && settings.receipt.showLogo && business.logoUrl && <img src={business.logoUrl} alt="Logo" className="mx-auto mb-3 max-h-16" />}
     {isKitchen && settings.kitchen.showLogo && business.logoUrl && <img src={business.logoUrl} alt="Logo" className="mx-auto mb-3 max-h-14" />}
     {isKitchen && settings.kitchen.showBusinessName && <p className="text-center text-sm font-black">{business.name}</p>}
     {!isKitchen && <div className="text-center text-xs"><p>{settings.receipt.nit ? `NIT: ${settings.receipt.nit}` : business.nit ? `NIT: ${business.nit}` : ""}</p><p>{settings.receipt.address}</p><p>{settings.receipt.phone}</p></div>}
     <TicketHeader order={order} settings={settings} mode={mode} />
     <div className="mt-4 space-y-3">{order.items.map((item) => <div key={item.id} className="border-t border-dashed border-slate-400 pt-3"><div className="flex justify-between gap-3"><p className="font-black">{item.quantity} x {item.productName}</p>{!isKitchen && <p>{money.format(itemUnitTotal(item) * item.quantity)}</p>}</div>{!isKitchen && <p className="text-xs">Unitario: {money.format(item.price)}</p>}{(!isKitchen || settings.kitchen.showAdditions) && item.additions.map((addition) => <p key={addition.id} className="text-sm">+ {addition.name} {!isKitchen ? money.format(addition.price) : ""}</p>)}{item.notes && (!isKitchen ? settings.receipt.showItemNotes : true) && <p className={`mt-1 text-sm ${isKitchen && settings.kitchen.highlightNotes ? "font-black" : "font-bold"}`}>Nota: {item.notes}</p>}</div>)}</div>
-    {!isKitchen && <><Totals order={order} receipt={settings.receipt} /><p className="mt-3 text-sm font-bold">Pago: {order.paymentMethod ?? "Pendiente"}</p><p className="mt-2 text-center text-sm">{settings.receipt.footerMessage}</p><p className="text-center text-xs">{settings.receipt.socialText}</p></>}
+    {isPrecheck && <p className="mt-4 rounded-md border border-dashed border-slate-500 p-2 text-center text-sm font-black">Precuenta / No valido como recibo final</p>}
+    {!isKitchen && <><Totals order={order} receipt={settings.receipt} />{!isPrecheck && <p className="mt-3 text-sm font-bold">Pago: {order.paymentMethod ?? "Pendiente"}</p>}<p className="mt-2 text-center text-sm">{isPrecheck ? "Total estimado" : settings.receipt.footerMessage}</p>{!isPrecheck && <p className="text-center text-xs">{settings.receipt.socialText}</p>}</>}
     {isKitchen && settings.kitchen.internalMessage && <p className="mt-3 border-t border-dashed border-slate-400 pt-2 text-center text-sm font-bold">{settings.kitchen.internalMessage}</p>}
     {mode === "detalle" && role === "admin" && <AuditTrail events={order.audit} />}
-  </TicketShell><div className="no-print mt-3 flex gap-2"><button className="flex min-h-12 flex-1 items-center justify-center gap-2 rounded-md bg-ink px-4 font-bold text-white" onClick={() => { onPrint(isKitchen ? "Comanda impresa" : "Recibo impreso"); printService({ type: settings.printing.type, label: isKitchen ? "Comanda" : "Recibo" }); }}><Printer size={20} /> {isKitchen ? "Reimprimir comanda" : "Reimprimir recibo"}</button><IconButton title="Cerrar" onClick={onClose}><X size={20} /></IconButton></div></div></div>;
+  </TicketShell><div className="no-print mt-3 flex gap-2"><button className="flex min-h-12 flex-1 items-center justify-center gap-2 rounded-md bg-ink px-4 font-bold text-white" onClick={() => { onPrint(isKitchen ? "Comanda impresa" : isPrecheck ? "Precuenta impresa" : "Recibo impreso"); printService({ type: settings.printing.type, label: isKitchen ? "Comanda" : isPrecheck ? "Precuenta" : "Recibo" }); }}><Printer size={20} /> {isKitchen ? "Imprimir comanda" : isPrecheck ? "Imprimir precuenta" : "Reimprimir recibo"}</button><IconButton title="Cerrar" onClick={onClose}><X size={20} /></IconButton></div></div></div>;
 }
 
 function AuditTrail({ events }: { events: AuditEvent[] }) {
@@ -1784,16 +1940,25 @@ function TicketShell({ title, size, children }: { title: string; size?: string; 
 
 function TicketHeader({ order, settings, mode }: { order: Order; settings: AppSettings; mode: Exclude<PrintMode, null> }) {
   const isKitchen = mode === "comanda";
+  const isPrecheck = mode === "precuenta";
   const date = order.closedAt ?? order.createdAt;
-  return <div className="mt-4 space-y-1 text-sm">{!isKitchen && <p>Recibo: R-{String(order.number).padStart(5, "0")}</p>}{(!isKitchen || settings.kitchen.showOrderNumber) && <p>Orden: #{order.number}</p>}{!isKitchen && settings.receipt.showCashier && <p>Cajero: {order.cashier ?? "-"}</p>}{isKitchen && settings.kitchen.showCashier && <p>Cajero: {order.cashier ?? "-"}</p>}{((!isKitchen && settings.receipt.showOrderSource) || (isKitchen && settings.kitchen.showOrderSource)) && <p>{order.tableName ?? order.type}</p>}{!isKitchen && <p>Fecha: {formatDate(date)}</p>}{!isKitchen && <p>Hora: {formatTime(date)}</p>}{isKitchen && settings.kitchen.showTime && <p>{formatDateTime(date)}</p>}</div>;
+  return <div className="mt-4 space-y-1 text-sm">{!isKitchen && !isPrecheck && <p>Recibo: R-{String(order.number).padStart(5, "0")}</p>}{(!isKitchen || settings.kitchen.showOrderNumber) && <p>Orden: #{order.number}</p>}{!isKitchen && settings.receipt.showCashier && <p>Cajero: {order.cashier ?? "-"}</p>}{isKitchen && settings.kitchen.showCashier && <p>Cajero: {order.cashier ?? "-"}</p>}{((!isKitchen && settings.receipt.showOrderSource) || (isKitchen && settings.kitchen.showOrderSource)) && <p>{order.tableName ?? order.type}</p>}{!isKitchen && <p>Fecha: {formatDate(date)}</p>}{!isKitchen && <p>Hora: {formatTime(date)}</p>}{isKitchen && settings.kitchen.showTime && <p>{formatDateTime(date)}</p>}</div>;
 }
 
 function Totals({ order, receipt = initialSettings.receipt }: { order: Order; receipt?: ReceiptSettings }) {
   return <div className="mt-5 space-y-2 border-t border-line pt-4"><div className="flex justify-between"><span>Subtotal</span><strong>{money.format(order.subtotal)}</strong></div>{receipt.showTip && order.tip > 0 && <div className="flex justify-between"><span>Propina</span><strong>{money.format(order.tip)}</strong></div>}<div className="flex justify-between text-xl font-black"><span>Total</span><span>{money.format(order.total)}</span></div></div>;
 }
 
+function presetLabel(value: DatePreset) {
+  if (value === "semana") return "Semana";
+  if (value === "mes") return "Mes";
+  if (value === "anio") return "Ano";
+  if (value === "rango") return "Rango personalizado";
+  return value;
+}
+
 function DatePresetButtons({ preset, setPreset }: { preset: DatePreset; setPreset: (preset: DatePreset) => void }) {
-  return <div className="mt-4 flex flex-wrap gap-2">{(["hoy", "ayer", "semana", "mes", "rango"] as DatePreset[]).map((value) => <button key={value} className={`min-h-11 rounded-md border px-4 font-bold ${preset === value ? "border-brand bg-brand text-white" : "border-line bg-white"}`} onClick={() => setPreset(value)}>{value === "semana" ? "Esta semana" : value === "mes" ? "Este mes" : value === "rango" ? "Rango personalizado" : value}</button>)}</div>;
+  return <div className="mt-4 flex flex-wrap gap-2">{(["hoy", "ayer", "semana", "mes", "anio", "rango"] as DatePreset[]).map((value) => <button key={value} className={`min-h-11 rounded-md border px-4 font-bold ${preset === value ? "border-brand bg-brand text-white" : "border-line bg-white"}`} onClick={() => setPreset(value)}>{presetLabel(value)}</button>)}</div>;
 }
 
 function DateRangeInputs({ range, setRange }: { range: { from: string; to: string }; setRange: (range: { from: string; to: string }) => void }) {
