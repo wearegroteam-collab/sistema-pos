@@ -212,6 +212,7 @@ const initialSettings: AppSettings = {
 };
 
 function createId(prefix: string) {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
@@ -351,6 +352,34 @@ function getShiftSummary(shift: CashShift, orders: Order[]) {
     expectedCash: shift.openingAmount + totals.cash,
     difference: 0
   };
+}
+
+function hasOrderItems(order: Order) {
+  return order.items.length > 0;
+}
+
+function isClosedOrder(order: Order) {
+  return ["pagada", "cancelada", "anulada"].includes(order.status);
+}
+
+function visibleOrder(order: Order) {
+  return hasOrderItems(order);
+}
+
+function deriveTableStatus(table: RestaurantTable, orders: Order[]): TableStatus {
+  if (table.status === "bloqueada") return "bloqueada";
+  const activeOrder = orders.find((order) => order.tableId === table.id && !isClosedOrder(order) && hasOrderItems(order));
+  if (!activeOrder) return "libre";
+  if (activeOrder.status === "esperando_pago") return "esperando_pago";
+  return "ocupada";
+}
+
+function normalizeTableStatuses(tables: RestaurantTable[], orders: Order[]) {
+  return tables.map((table) => ({ ...table, status: deriveTableStatus(table, orders) }));
+}
+
+function isUuid(value?: string) {
+  return Boolean(value && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value));
 }
 
 function normalizeRole(role?: string | null): Role | null {
@@ -578,19 +607,29 @@ export function PosApp() {
   const businessProducts = products.filter((item) => (item.businessId ?? activeBusinessId) === activeBusinessId);
   const businessAdditions = additions.filter((item) => (item.businessId ?? activeBusinessId) === activeBusinessId);
   const businessTables = tables.filter((item) => (item.businessId ?? activeBusinessId) === activeBusinessId);
-  const businessOrders = orders.filter((item) => (item.businessId ?? activeBusinessId) === activeBusinessId);
+  const businessOrders = orders.filter((item) => (item.businessId ?? activeBusinessId) === activeBusinessId && visibleOrder(item));
   const activeOrder = orders.find((order) => order.id === activeOrderId) ?? null;
-  const openBusinessOrders = businessOrders.filter((order) => !["pagada", "cancelada", "anulada"].includes(order.status));
-  const orderedTables = useMemo(() => [...businessTables].sort((a, b) => a.sortOrder - b.sortOrder), [businessTables]);
+  const openBusinessOrders = businessOrders.filter((order) => !isClosedOrder(order) && hasOrderItems(order));
+  const orderedTables = useMemo(() => normalizeTableStatuses([...businessTables].sort((a, b) => a.sortOrder - b.sortOrder), orders), [businessTables, orders]);
 
   function updateOrder(orderId: string, updater: (order: Order) => Order) {
     setOrders((current) =>
-      current.map((order) => {
+      current.flatMap((order) => {
         if (order.id !== orderId) return order;
         const updated = updater(order);
-        return { ...updated, ...calculateOrder(updated.items, settings.checkout.tipEnabled ? updated.tip : 0) };
+        const calculated = { ...updated, ...calculateOrder(updated.items, settings.checkout.tipEnabled ? updated.tip : 0) };
+        if (!hasOrderItems(calculated) && !isClosedOrder(calculated)) return [];
+        return calculated;
       })
     );
+  }
+
+  function closeActiveOrderDrawer() {
+    if (activeOrder && !hasOrderItems(activeOrder) && !isClosedOrder(activeOrder)) {
+      setOrders((current) => current.filter((order) => order.id !== activeOrder.id));
+    }
+    setActiveOrderId(null);
+    setPrintMode(null);
   }
 
   function appendAudit(orderId: string, action: string, reason?: string) {
@@ -626,7 +665,6 @@ export function PosApp() {
     if (existing) return setActiveOrderId(existing.id);
     const order = makeOrder("mesa", table);
     setOrders((current) => [order, ...current]);
-    setTables((current) => current.map((item) => (item.id === table.id ? { ...item, status: "ocupada" } : item)));
     setActiveOrderId(order.id);
   }
 
@@ -807,6 +845,34 @@ export function PosApp() {
           .map((row) => mapBusinessUserRow(row as Record<string, unknown>, email))
           .filter((user): user is BusinessUser => Boolean(user));
         setBusinessUsers(users);
+      }
+      const { data: settingsRow } = await supabase
+        .from("settings")
+        .select("receipt_settings,kitchen_settings,checkout_settings,printing_settings,payment_methods,cashier_permissions")
+        .eq("business_id", selectedUser.businessId)
+        .maybeSingle();
+      if (settingsRow) {
+        setSettings(normalizeSettings({
+          receipt: settingsRow.receipt_settings as ReceiptSettings,
+          kitchen: settingsRow.kitchen_settings as KitchenSettings,
+          checkout: settingsRow.checkout_settings as AppSettings["checkout"],
+          printing: settingsRow.printing_settings as AppSettings["printing"],
+          paymentMethods: settingsRow.payment_methods as PaymentMethodConfig[],
+          cashierPermissions: settingsRow.cashier_permissions as CashierPermissions
+        }));
+      }
+      const { data: categoryRows } = await supabase.from("categories").select("id,business_id,name").eq("business_id", selectedUser.businessId).order("sort_order", { ascending: true });
+      if (categoryRows) setCategories((current) => [...current.filter((item) => item.businessId !== selectedUser.businessId), ...categoryRows.map((row) => ({ id: String(row.id), businessId: String(row.business_id), name: String(row.name) }))]);
+
+      const { data: productRows } = await supabase.from("products").select("id,business_id,category_id,name,price,description,active").eq("business_id", selectedUser.businessId).order("name", { ascending: true });
+      if (productRows) setProducts((current) => [...current.filter((item) => item.businessId !== selectedUser.businessId), ...productRows.map((row) => ({ id: String(row.id), businessId: String(row.business_id), categoryId: String(row.category_id), name: String(row.name), price: Number(row.price) || 0, description: row.description ? String(row.description) : "", active: Boolean(row.active) }))]);
+
+      const { data: tableRows } = await supabase.from("restaurant_tables").select("id,business_id,name,status,sort_order,x,y,width,height,shape,zone").eq("business_id", selectedUser.businessId).order("sort_order", { ascending: true });
+      if (tableRows) {
+        setTables((current) => [
+          ...current.filter((item) => item.businessId !== selectedUser.businessId),
+          ...normalizeTables(tableRows.map((row) => ({ id: String(row.id), businessId: String(row.business_id), name: String(row.name), status: row.status as TableStatus, sortOrder: Number(row.sort_order) || 0, x: Number(row.x) || 40, y: Number(row.y) || 40, width: Number(row.width) || 110, height: Number(row.height) || 90, shape: row.shape as RestaurantTable["shape"], zone: row.zone ? String(row.zone) : "Salon" })))
+        ]);
       }
       setInvitations((current) => current.map((invite) => invite.businessId === selectedUser.businessId && invite.email === selectedUser.email && invite.role === selectedUser.role ? { ...invite, status: "accepted" } : invite));
     }
@@ -996,7 +1062,7 @@ export function PosApp() {
           additions={businessAdditions}
           printMode={printMode}
           setPrintMode={setPrintMode}
-          onClose={() => { setActiveOrderId(null); setPrintMode(null); }}
+          onClose={closeActiveOrderDrawer}
           addProduct={addProductToActiveOrder}
           updateOrder={updateOrder}
           appendAudit={appendAudit}
@@ -1159,6 +1225,8 @@ function OnboardingWizard({
   const [categoryName, setCategoryName] = useState("");
   const [productDraft, setProductDraft] = useState({ name: "", price: "", categoryId: categories[0]?.id ?? "", description: "" });
   const [tableName, setTableName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
   const progress = Math.round(((step + 1) / steps.length) * 100);
 
   async function uploadLogo(file?: File) {
@@ -1177,8 +1245,67 @@ function OnboardingWizard({
     reader.readAsDataURL(file);
   }
 
-  function finish(skipped = false) {
-    setBusiness((current) => ({ ...current, onboardingCompleted: !skipped, onboardingSkipped: skipped }));
+  async function persistOnboarding(skipped: boolean) {
+    if (!supabase) return;
+    const completedBusiness = { ...business, onboardingCompleted: true, onboardingSkipped: skipped };
+    const { error: settingsError } = await supabase.from("settings").upsert({
+      business_id: activeBusinessId,
+      receipt_settings: settings.receipt,
+      kitchen_settings: settings.kitchen,
+      kitchen_ticket_settings: settings.kitchen,
+      printing_settings: settings.printing,
+      checkout_settings: settings.checkout,
+      payment_methods: settings.paymentMethods,
+      cashier_permissions: settings.cashierPermissions
+    }, { onConflict: "business_id" });
+    if (settingsError) throw settingsError;
+
+    const categoryRows = categories.filter((category) => isUuid(category.id)).map((category, index) => ({ id: category.id, business_id: activeBusinessId, name: category.name, sort_order: index, active: true }));
+    if (categoryRows.length) {
+      const { error } = await supabase.from("categories").upsert(categoryRows, { onConflict: "id" });
+      if (error) throw error;
+    }
+
+    const productRows = products.filter((product) => isUuid(product.id) && isUuid(product.categoryId)).map((product) => ({ id: product.id, business_id: activeBusinessId, category_id: product.categoryId, name: product.name, price: product.price, description: product.description ?? null, active: product.active }));
+    if (productRows.length) {
+      const { error } = await supabase.from("products").upsert(productRows, { onConflict: "id" });
+      if (error) throw error;
+    }
+
+    const tableRows = tables.filter((table) => isUuid(table.id)).map((table) => ({ id: table.id, business_id: activeBusinessId, name: table.name, status: deriveTableStatus(table, []), sort_order: table.sortOrder, x: table.x ?? 40, y: table.y ?? 40, width: table.width ?? 110, height: table.height ?? 90, shape: table.shape ?? "rectangle", zone: table.zone ?? "Salon" }));
+    if (tableRows.length) {
+      const { error } = await supabase.from("restaurant_tables").upsert(tableRows, { onConflict: "id" });
+      if (error) throw error;
+    }
+
+    const { error: businessError } = await supabase
+      .from("businesses")
+      .update({
+        name: completedBusiness.name,
+        logo_url: completedBusiness.logoUrl ?? null,
+        address: completedBusiness.address,
+        phone: completedBusiness.phone,
+        email: completedBusiness.email,
+        nit: completedBusiness.nit ?? null,
+        onboarding_completed: true,
+        onboarding_skipped: skipped,
+        updated_at: now()
+      })
+      .eq("id", activeBusinessId);
+    if (businessError) throw businessError;
+  }
+
+  async function finish(skipped = false) {
+    setSaving(true);
+    setSaveError("");
+    try {
+      await persistOnboarding(skipped);
+      setBusiness((current) => ({ ...current, onboardingCompleted: true, onboardingSkipped: skipped }));
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : "No se pudo guardar la configuracion inicial.");
+    } finally {
+      setSaving(false);
+    }
   }
 
   function addCategory() {
@@ -1218,8 +1345,9 @@ function OnboardingWizard({
         <div className="rounded-md border border-line bg-white p-4 shadow-soft">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <strong>Paso {step + 1} de {steps.length}: {steps[step]}</strong>
-            <button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => finish(true)}>Saltar onboarding</button>
+            <button disabled={saving} className="rounded-md border border-line px-3 py-2 font-bold disabled:opacity-40" onClick={() => finish(true)}>{saving ? "Guardando..." : "Saltar onboarding"}</button>
           </div>
+          {saveError && <p className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm font-bold text-red-800">Error guardando onboarding: {saveError}</p>}
           <div className="mt-3 h-3 overflow-hidden rounded-full bg-surface">
             <div className="h-full bg-brand transition-all" style={{ width: `${progress}%` }} />
           </div>
@@ -1237,7 +1365,7 @@ function OnboardingWizard({
 
         <div className="flex flex-wrap justify-between gap-3">
           <button disabled={step === 0} className="min-h-11 rounded-md border border-line bg-white px-4 font-bold disabled:opacity-40" onClick={() => setStep((current) => Math.max(0, current - 1))}>Anterior</button>
-          {step < steps.length - 1 ? <button className="min-h-11 rounded-md bg-brand px-4 font-bold text-white" onClick={() => setStep((current) => Math.min(steps.length - 1, current + 1))}>Continuar</button> : <button className="min-h-11 rounded-md bg-ink px-4 font-bold text-white" onClick={() => finish(false)}>Finalizar configuracion</button>}
+          {step < steps.length - 1 ? <button disabled={saving} className="min-h-11 rounded-md bg-brand px-4 font-bold text-white disabled:opacity-40" onClick={() => setStep((current) => Math.min(steps.length - 1, current + 1))}>Continuar</button> : <button disabled={saving} className="min-h-11 rounded-md bg-ink px-4 font-bold text-white disabled:opacity-40" onClick={() => finish(false)}>{saving ? "Guardando..." : "Finalizar configuracion"}</button>}
         </div>
       </section>
     </main>
