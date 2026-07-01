@@ -161,7 +161,7 @@ create table if not exists public.shifts (
   closed_at timestamptz,
   opening_amount numeric(12, 2) not null default 0,
   opening_note text,
-  status text not null default 'abierto' check (status in ('abierto', 'cerrado')),
+  status text not null default 'open' check (status in ('open', 'closed')),
   expected_totals jsonb,
   counted_totals jsonb,
   difference numeric(12, 2),
@@ -249,3 +249,4 @@ create index if not exists idx_orders_test_mode on public.orders(test_mode);
 create index if not exists idx_orders_created_at on public.orders(created_at);
 create index if not exists idx_payments_business_id on public.payments(business_id);
 create index if not exists idx_shifts_business_id on public.shifts(business_id);
+create unique index if not exists shifts_one_open_per_business on public.shifts (business_id) where status = 'open';

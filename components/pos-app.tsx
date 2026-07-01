@@ -367,11 +367,8 @@ function visibleOrder(order: Order) {
 }
 
 function deriveTableStatus(table: RestaurantTable, orders: Order[]): TableStatus {
-  if (table.status === "bloqueada") return "bloqueada";
   const activeOrder = orders.find((order) => order.tableId === table.id && !isClosedOrder(order) && hasOrderItems(order));
-  if (!activeOrder) return "libre";
-  if (activeOrder.status === "esperando_pago") return "esperando_pago";
-  return "ocupada";
+  return activeOrder ? "ocupada" : "libre";
 }
 
 function normalizeTableStatuses(tables: RestaurantTable[], orders: Order[]) {
@@ -442,6 +439,48 @@ function mapInvitationRow(row: Record<string, unknown>): Invitation | null {
     status: row.status === "accepted" || row.status === "expired" ? row.status : "pending",
     invitedBy: row.invited_by ? String(row.invited_by) : "",
     createdAt: String(row.created_at ?? now())
+  };
+}
+
+function mapShiftStatus(status: unknown): CashShift["status"] {
+  return status === "open" || status === "abierto" ? "abierto" : "cerrado";
+}
+
+function shiftStatusForDatabase(status: CashShift["status"]) {
+  return status === "abierto" ? "open" : "closed";
+}
+
+function mapShiftRow(row: Record<string, unknown>): CashShift {
+  const expected = row.expected_totals as Partial<CashShift["expected"]> | null;
+  const counted = row.counted_totals as Partial<CashShift["counted"]> | null;
+  const difference = Number(row.difference ?? expected?.difference ?? 0);
+  return {
+    id: String(row.id),
+    businessId: String(row.business_id),
+    cashier: String(row.opened_by_name ?? "Caja"),
+    openedAt: String(row.opened_at ?? now()),
+    closedAt: row.closed_at ? String(row.closed_at) : undefined,
+    openingAmount: Number(row.opening_amount) || 0,
+    openingNote: row.opening_note ? String(row.opening_note) : undefined,
+    status: mapShiftStatus(row.status),
+    testMode: Boolean(row.test_mode),
+    expected: expected ? {
+      cash: Number(expected.cash) || 0,
+      card: Number(expected.card) || 0,
+      transfer: Number(expected.transfer) || 0,
+      other: Number(expected.other) || 0,
+      totalSales: Number(expected.totalSales) || 0,
+      expectedCash: Number(expected.expectedCash) || 0,
+      difference
+    } : undefined,
+    counted: counted ? {
+      cash: Number(counted.cash) || 0,
+      card: Number(counted.card) || 0,
+      transfer: Number(counted.transfer) || 0,
+      other: Number(counted.other) || 0
+    } : undefined,
+    closingNote: row.closing_note ? String(row.closing_note) : undefined,
+    closedBy: row.closed_by_name ? String(row.closed_by_name) : undefined
   };
 }
 
@@ -536,6 +575,7 @@ export function PosApp() {
   const [session, setSession] = useState<{ email: string; userId?: string } | null>(null);
   const [login, setLogin] = useState({ email: "", password: "" });
   const [loginError, setLoginError] = useState("");
+  const [shiftError, setShiftError] = useState("");
   const [authLoading, setAuthLoading] = useState(true);
   const [supportBusinessId, setSupportBusinessId] = useState<string | null>(null);
 
@@ -639,6 +679,24 @@ export function PosApp() {
     );
   }
 
+  async function loadBusinessShifts(businessId: string) {
+    if (!supabase) return;
+    const { data, error } = await supabase
+      .from("shifts")
+      .select("id,business_id,opened_by,opened_by_name,closed_by,closed_by_name,opened_at,closed_at,opening_amount,opening_note,status,expected_totals,counted_totals,difference,closing_note,test_mode")
+      .eq("business_id", businessId)
+      .order("opened_at", { ascending: false });
+    if (error) {
+      setShiftError(getDatabaseErrorMessage(error, "No se pudieron cargar los turnos desde Supabase."));
+      return;
+    }
+    setShifts((current) => [
+      ...current.filter((shift) => shift.businessId !== businessId),
+      ...(data ?? []).map((row) => mapShiftRow(row as Record<string, unknown>))
+    ]);
+    setShiftError("");
+  }
+
   function closeActiveOrderDrawer() {
     if (activeOrder && !hasOrderItems(activeOrder) && !isClosedOrder(activeOrder)) {
       setOrders((current) => current.filter((order) => order.id !== activeOrder.id));
@@ -676,7 +734,7 @@ export function PosApp() {
     if (!can("createOrders")) return;
     if (table.status === "bloqueada") return;
     if (!activeShift && !currentBusiness.testMode) return;
-    const existing = orders.find((order) => order.tableId === table.id && !["pagada", "cancelada", "anulada"].includes(order.status));
+    const existing = orders.find((order) => order.tableId === table.id && !["pagada", "cancelada", "anulada"].includes(order.status) && hasOrderItems(order));
     if (existing) return setActiveOrderId(existing.id);
     const order = makeOrder("mesa", table);
     setOrders((current) => [order, ...current]);
@@ -718,9 +776,13 @@ export function PosApp() {
     setPrintMode("recibo");
   }
 
-  function openShift(openingAmount: number, openingNote?: string) {
-    setShifts((current) => [
-      {
+  async function openShift(openingAmount: number, openingNote?: string) {
+    if (activeShift) {
+      setShiftError("Ya existe un turno abierto.");
+      return false;
+    }
+    if (!supabase || currentBusiness.testMode) {
+      const shift: CashShift = {
         id: createId("shift"),
         businessId: activeBusinessId,
         cashier: currentUser,
@@ -728,32 +790,105 @@ export function PosApp() {
         openingAmount,
         openingNote,
         status: "abierto",
-        testMode: false
-      },
-      ...current
-    ]);
+        testMode: currentBusiness.testMode
+      };
+      setShifts((current) => [shift, ...current.filter((item) => !(item.businessId === activeBusinessId && item.status === "abierto"))]);
+      setShiftError("");
+      return true;
+    }
+    try {
+      const client = requireSupabase();
+      const { data: existing, error: existingError } = await client
+        .from("shifts")
+        .select("id,business_id,opened_by,opened_by_name,closed_by,closed_by_name,opened_at,closed_at,opening_amount,opening_note,status,expected_totals,counted_totals,difference,closing_note,test_mode")
+        .eq("business_id", activeBusinessId)
+        .in("status", ["open", "abierto"])
+        .eq("test_mode", false)
+        .order("opened_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (existingError) throw existingError;
+      if (existing) {
+        const shift = mapShiftRow(existing as Record<string, unknown>);
+        setShifts((current) => [shift, ...current.filter((item) => item.id !== shift.id)]);
+        setShiftError("Ya existe un turno abierto.");
+        return false;
+      }
+      const openedAt = now();
+      const { data, error } = await client
+        .from("shifts")
+        .insert({
+          business_id: activeBusinessId,
+          opened_by: session?.userId ?? null,
+          opened_by_name: currentUser,
+          opened_at: openedAt,
+          opening_amount: openingAmount,
+          opening_note: openingNote || null,
+          status: "open",
+          test_mode: currentBusiness.testMode
+        })
+        .select("id,business_id,opened_by,opened_by_name,closed_by,closed_by_name,opened_at,closed_at,opening_amount,opening_note,status,expected_totals,counted_totals,difference,closing_note,test_mode")
+        .single();
+      if (error) throw error;
+      const shift = mapShiftRow(data as Record<string, unknown>);
+      setShifts((current) => [shift, ...current.filter((item) => item.id !== shift.id)]);
+      setShiftError("");
+      return true;
+    } catch (error) {
+      const message = getDatabaseErrorMessage(error, "No se pudo abrir el turno en Supabase.");
+      setShiftError(message.includes("duplicate") || message.includes("unique") ? "Ya existe un turno abierto." : message);
+      return false;
+    }
   }
 
-  function closeShift(counted: CashShift["counted"], closingNote: string) {
+  async function closeShift(counted: CashShift["counted"], closingNote: string) {
     if (!activeShift || !counted) return;
     const expected = getShiftSummary(activeShift, orders);
     const countedTotal = counted.cash + counted.card + counted.transfer + counted.other;
     const expectedTotal = expected.expectedCash + expected.card + expected.transfer + expected.other;
-    setShifts((current) =>
-      current.map((shift) =>
-        shift.id === activeShift.id
-          ? {
-              ...shift,
-              status: "cerrado",
-              closedAt: now(),
-              closedBy: currentUser,
-              expected: { ...expected, difference: countedTotal - expectedTotal },
-              counted,
-              closingNote
-            }
-          : shift
-      )
-    );
+    const closedAt = now();
+    const closedShift: CashShift = {
+      ...activeShift,
+      status: "cerrado",
+      closedAt,
+      closedBy: currentUser,
+      expected: { ...expected, difference: countedTotal - expectedTotal },
+      counted,
+      closingNote
+    };
+    if (supabase && !activeShift.testMode) {
+      try {
+        const { data, error } = await supabase
+          .from("shifts")
+          .update({
+            status: shiftStatusForDatabase("cerrado"),
+            closed_at: closedAt,
+            closed_by: session?.userId ?? null,
+            closed_by_name: currentUser,
+            expected_totals: expected,
+            counted_totals: counted,
+            difference: countedTotal - expectedTotal,
+            closing_note: closingNote,
+            updated_at: closedAt
+          })
+          .eq("id", activeShift.id)
+          .eq("business_id", activeBusinessId)
+          .in("status", ["open", "abierto"])
+          .select("id,business_id,opened_by,opened_by_name,closed_by,closed_by_name,opened_at,closed_at,opening_amount,opening_note,status,expected_totals,counted_totals,difference,closing_note,test_mode")
+          .single();
+        if (error) throw error;
+        const mapped = mapShiftRow(data as Record<string, unknown>);
+        setShifts((current) => current.map((shift) => shift.id === activeShift.id ? mapped : shift));
+        setShiftError("");
+        setShowCloseShift(false);
+        return;
+      } catch (error) {
+        setShiftError(getDatabaseErrorMessage(error, "No se pudo cerrar el turno en Supabase."));
+        return;
+      }
+    }
+    setShifts((current) => current.map((shift) => shift.id === activeShift.id ? closedShift : shift));
+    setShiftError("");
     setShowCloseShift(false);
   }
 
@@ -905,6 +1040,7 @@ export function PosApp() {
           ...normalizeTables(tableRows.map((row) => ({ id: String(row.id), businessId: String(row.business_id), name: String(row.name), status: row.status as TableStatus, sortOrder: Number(row.sort_order) || 0, x: Number(row.x) || 40, y: Number(row.y) || 40, width: Number(row.width) || 110, height: Number(row.height) || 90, shape: row.shape as RestaurantTable["shape"], zone: row.zone ? String(row.zone) : "Salon" })))
         ]);
       }
+      await loadBusinessShifts(selectedUser.businessId);
       setInvitations((current) => current.map((invite) => invite.businessId === selectedUser.businessId && invite.email === selectedUser.email && invite.role === selectedUser.role ? { ...invite, status: "accepted" } : invite));
     }
 
@@ -954,6 +1090,7 @@ export function PosApp() {
     setActiveBusinessId(businessId);
     setSupportBusinessId(businessId);
     setTab("vender");
+    await loadBusinessShifts(businessId);
     if (supabase && session?.userId) {
       await supabase.from("audit_logs").insert({
         business_id: businessId,
@@ -1071,6 +1208,7 @@ export function PosApp() {
       </div>
 
       <section className="mx-auto max-w-7xl px-4 py-5">
+        {shiftError && <p className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm font-bold text-red-800">{shiftError}</p>}
         {tab === "dashboard" && (can("viewTables") ? <DashboardView orders={businessOrders} products={businessProducts} /> : <NoPermission />)}
         {tab === "vender" && (can("viewTables") ? <TablesView role={role} tables={orderedTables} openOrders={openBusinessOrders} setTables={setTables} activeBusinessId={activeBusinessId} activeShift={activeShift} testMode={currentBusiness.testMode} canOpenShift={can("openShift")} openShift={openShift} openOrderForTable={openOrderForTable} createDirectOrder={createDirectOrder} openExistingOrder={setActiveOrderId} /> : <NoPermission />)}
         {tab === "ventas" && (can("viewOrders") ? <SalesView orders={businessOrders} shifts={shifts.filter((shift) => (shift.businessId ?? activeBusinessId) === activeBusinessId)} setActiveOrderId={setActiveOrderId} setPrintMode={setPrintMode} /> : <NoPermission />)}
@@ -1677,7 +1815,7 @@ function InnerTabs<T extends string>({ tabs, current, onChange }: { tabs: { id: 
   );
 }
 
-function TablesView({ role, tables, openOrders, setTables, activeBusinessId, activeShift, testMode, canOpenShift, openShift, openOrderForTable, createDirectOrder, openExistingOrder }: { role: Role; tables: RestaurantTable[]; openOrders: Order[]; setTables: React.Dispatch<React.SetStateAction<RestaurantTable[]>>; activeBusinessId: string; activeShift: CashShift | null; testMode: boolean; canOpenShift: boolean; openShift: (openingAmount: number, openingNote?: string) => void; openOrderForTable: (table: RestaurantTable) => void; createDirectOrder: (type: Exclude<OrderType, "mesa">) => void; openExistingOrder: (orderId: string) => void }) {
+function TablesView({ role, tables, openOrders, setTables, activeBusinessId, activeShift, testMode, canOpenShift, openShift, openOrderForTable, createDirectOrder, openExistingOrder }: { role: Role; tables: RestaurantTable[]; openOrders: Order[]; setTables: React.Dispatch<React.SetStateAction<RestaurantTable[]>>; activeBusinessId: string; activeShift: CashShift | null; testMode: boolean; canOpenShift: boolean; openShift: (openingAmount: number, openingNote?: string) => Promise<boolean>; openOrderForTable: (table: RestaurantTable) => void; createDirectOrder: (type: Exclude<OrderType, "mesa">) => void; openExistingOrder: (orderId: string) => void }) {
   const [configMode, setConfigMode] = useState(false);
   const [name, setName] = useState("");
   const [showOpenShift, setShowOpenShift] = useState(false);
@@ -1766,7 +1904,7 @@ function TablesView({ role, tables, openOrders, setTables, activeBusinessId, act
     }
     setDragging(null);
   };
-  const statusClass = (status: TableStatus) => status === "libre" ? "bg-emerald-100 text-emerald-800 border-emerald-300" : status === "ocupada" ? "bg-orange-100 text-orange-800 border-orange-300" : status === "esperando_pago" ? "bg-sky-100 text-sky-800 border-sky-300" : "bg-slate-200 text-slate-600 border-slate-300";
+  const statusClass = (status: TableStatus) => status === "libre" ? "bg-emerald-100 text-emerald-800 border-emerald-300" : "bg-red-100 text-red-800 border-red-300";
   return (
     <div className="space-y-5">
       <div className="flex flex-col gap-3 rounded-md border border-line bg-white p-4 shadow-soft lg:flex-row lg:items-end lg:justify-between">
@@ -1779,7 +1917,7 @@ function TablesView({ role, tables, openOrders, setTables, activeBusinessId, act
       </div>
       {saveError && <p className="rounded-md border border-red-200 bg-red-50 p-3 text-sm font-bold text-red-800">{saveError}</p>}
       {!canSell && <div className="rounded-md border border-yellow-200 bg-yellow-50 p-4 text-yellow-900"><div className="flex flex-wrap items-center justify-between gap-3"><p className="font-bold">No hay turno abierto. Abre turno para comenzar a vender.</p><button disabled={!canOpenShift} className="rounded-md bg-ink px-4 py-2 font-bold text-white disabled:opacity-40" onClick={() => setShowOpenShift(true)}>Abrir turno</button></div></div>}
-      {showOpenShift && <div className="rounded-md border border-line bg-white p-4 shadow-soft"><OpenShiftPanel cashier="Caja" onOpen={(amount, note) => { openShift(amount, note); setShowOpenShift(false); }} /></div>}
+      {showOpenShift && <div className="rounded-md border border-line bg-white p-4 shadow-soft"><OpenShiftPanel cashier="Caja" onOpen={async (amount, note) => { const opened = await openShift(amount, note); if (opened) setShowOpenShift(false); }} /></div>}
       {openOrders.length > 0 && (
         <section className="rounded-md border border-line bg-white p-4 shadow-soft">
           <div className="flex flex-wrap items-center justify-between gap-3">
