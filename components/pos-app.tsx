@@ -476,6 +476,29 @@ async function postAdminApi(path: string, body: Record<string, unknown>) {
   return payload;
 }
 
+function getDatabaseErrorMessage(error: unknown, fallback: string) {
+  return (error as { message?: string })?.message ?? fallback;
+}
+
+function requireSupabase() {
+  if (!supabase) throw new Error("Supabase no esta configurado.");
+  return supabase;
+}
+
+function settingsPayload(activeBusinessId: string, settings: AppSettings) {
+  return {
+    business_id: activeBusinessId,
+    receipt_settings: settings.receipt,
+    kitchen_settings: settings.kitchen,
+    kitchen_ticket_settings: settings.kitchen,
+    printing_settings: settings.printing,
+    checkout_settings: settings.checkout,
+    payment_methods: settings.paymentMethods,
+    cashier_permissions: settings.cashierPermissions,
+    updated_at: now()
+  };
+}
+
 function mapApiBusinessUser(row: Record<string, unknown>, fallbackEmail = ""): BusinessUser {
   return {
     id: String(row.id),
@@ -537,6 +560,7 @@ export function PosApp() {
   }, [initialPath]);
 
   useEffect(() => {
+    if (hasSupabaseConfig) return;
     const saved = window.localStorage.getItem("simple-pos-state");
     if (!saved) return;
     const parsed = JSON.parse(saved);
@@ -589,16 +613,7 @@ export function PosApp() {
     if (!supabase || !session || role === "super_admin" || activeBusinessId === "system") return;
     const client = supabase;
     const timer = window.setTimeout(() => {
-      void client.from("settings").upsert({
-        business_id: activeBusinessId,
-        receipt_settings: settings.receipt,
-        kitchen_settings: settings.kitchen,
-        kitchen_ticket_settings: settings.kitchen,
-        printing_settings: settings.printing,
-        checkout_settings: settings.checkout,
-        payment_methods: settings.paymentMethods,
-        cashier_permissions: settings.cashierPermissions
-      }, { onConflict: "business_id" });
+      void client.from("settings").upsert(settingsPayload(activeBusinessId, settings), { onConflict: "business_id" });
     }, 700);
     return () => window.clearTimeout(timer);
   }, [settings, activeBusinessId, session, role]);
@@ -861,13 +876,29 @@ export function PosApp() {
           cashierPermissions: settingsRow.cashier_permissions as CashierPermissions
         }));
       }
-      const { data: categoryRows } = await supabase.from("categories").select("id,business_id,name").eq("business_id", selectedUser.businessId).order("sort_order", { ascending: true });
+      const { data: categoryRows } = await supabase.from("categories").select("id,business_id,name").eq("business_id", selectedUser.businessId).eq("active", true).order("sort_order", { ascending: true });
       if (categoryRows) setCategories((current) => [...current.filter((item) => item.businessId !== selectedUser.businessId), ...categoryRows.map((row) => ({ id: String(row.id), businessId: String(row.business_id), name: String(row.name) }))]);
 
-      const { data: productRows } = await supabase.from("products").select("id,business_id,category_id,name,price,description,active").eq("business_id", selectedUser.businessId).order("name", { ascending: true });
+      const { data: productRows } = await supabase.from("products").select("id,business_id,category_id,name,price,description,active").eq("business_id", selectedUser.businessId).eq("active", true).order("name", { ascending: true });
       if (productRows) setProducts((current) => [...current.filter((item) => item.businessId !== selectedUser.businessId), ...productRows.map((row) => ({ id: String(row.id), businessId: String(row.business_id), categoryId: String(row.category_id), name: String(row.name), price: Number(row.price) || 0, description: row.description ? String(row.description) : "", active: Boolean(row.active) }))]);
 
-      const { data: tableRows } = await supabase.from("restaurant_tables").select("id,business_id,name,status,sort_order,x,y,width,height,shape,zone").eq("business_id", selectedUser.businessId).order("sort_order", { ascending: true });
+      const { data: extraRows } = await supabase.from("extras").select("id,business_id,name,price").eq("business_id", selectedUser.businessId).eq("active", true).order("name", { ascending: true });
+      const { data: productExtraRows } = await supabase.from("product_extras").select("product_id,extra_id").eq("business_id", selectedUser.businessId);
+      if (extraRows) {
+        const links = productExtraRows ?? [];
+        setAdditions((current) => [
+          ...current.filter((item) => item.businessId !== selectedUser.businessId),
+          ...extraRows.map((row) => ({
+            id: String(row.id),
+            businessId: String(row.business_id),
+            name: String(row.name),
+            price: Number(row.price) || 0,
+            productIds: links.filter((link) => String(link.extra_id) === String(row.id)).map((link) => String(link.product_id))
+          }))
+        ]);
+      }
+
+      const { data: tableRows } = await supabase.from("restaurant_tables").select("id,business_id,name,status,sort_order,x,y,width,height,shape,zone").eq("business_id", selectedUser.businessId).eq("active", true).order("sort_order", { ascending: true });
       if (tableRows) {
         setTables((current) => [
           ...current.filter((item) => item.businessId !== selectedUser.businessId),
@@ -1239,6 +1270,8 @@ function OnboardingWizard({
         setBusiness((current) => ({ ...current, logoUrl: data.publicUrl }));
         return;
       }
+      setSaveError(getDatabaseErrorMessage(error, "No se pudo subir el logo a Supabase Storage."));
+      return;
     }
     const reader = new FileReader();
     reader.onload = () => setBusiness((current) => ({ ...current, logoUrl: String(reader.result) }));
@@ -1649,10 +1682,65 @@ function TablesView({ role, tables, openOrders, setTables, activeBusinessId, act
   const [name, setName] = useState("");
   const [showOpenShift, setShowOpenShift] = useState(false);
   const [dragging, setDragging] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
+  const [saveError, setSaveError] = useState("");
   const canEdit = role === "admin";
   const canSell = Boolean(activeShift) || testMode;
   const zones = ["Salon", "Terraza", "Barra", "Patio"];
   const updateTable = (id: string, patch: Partial<RestaurantTable>) => setTables((current) => current.map((table) => table.id === id ? { ...table, ...patch } : table));
+  async function persistTable(table: RestaurantTable) {
+    try {
+      const client = requireSupabase();
+      const { error } = await client.from("restaurant_tables").upsert({
+        id: table.id,
+        business_id: activeBusinessId,
+        name: table.name,
+        status: table.status,
+        sort_order: table.sortOrder,
+        x: table.x ?? 40,
+        y: table.y ?? 40,
+        width: table.width ?? 110,
+        height: table.height ?? 90,
+        shape: table.shape ?? "rectangle",
+        zone: table.zone ?? "Salon",
+        active: true,
+        updated_at: now()
+      }, { onConflict: "id" });
+      if (error) throw error;
+      setSaveError("");
+    } catch (error) {
+      setSaveError(getDatabaseErrorMessage(error, "No se pudo guardar la mesa en Supabase."));
+      throw error;
+    }
+  }
+  function saveTablePatch(id: string, patch: Partial<RestaurantTable>) {
+    const current = tables.find((table) => table.id === id);
+    if (!current) return;
+    const next = { ...current, ...patch };
+    updateTable(id, patch);
+    void persistTable(next).catch(() => undefined);
+  }
+  async function createTable() {
+    if (!name.trim()) return;
+    const next: RestaurantTable = { id: createId("table"), businessId: activeBusinessId, name: name.trim(), status: "libre", sortOrder: tables.length + 1, x: 60, y: 60, width: 110, height: 90, shape: "rectangle", zone: "Salon" };
+    try {
+      await persistTable(next);
+      setTables((current) => [...current, next]);
+      setName("");
+    } catch (error) {
+      setSaveError(getDatabaseErrorMessage(error, "No se pudo crear la mesa en Supabase."));
+    }
+  }
+  async function deleteTable(table: RestaurantTable) {
+    try {
+      const client = requireSupabase();
+      const { error } = await client.from("restaurant_tables").update({ active: false, updated_at: now() }).eq("id", table.id).eq("business_id", activeBusinessId);
+      if (error) throw error;
+      setTables((current) => current.filter((item) => item.id !== table.id).map((item, index) => ({ ...item, sortOrder: index + 1 })));
+      setSaveError("");
+    } catch (error) {
+      setSaveError(getDatabaseErrorMessage(error, "No se pudo eliminar la mesa en Supabase."));
+    }
+  }
   const tryOpenTable = (table: RestaurantTable) => {
     if (!canSell) return setShowOpenShift(true);
     openOrderForTable(table);
@@ -1671,6 +1759,13 @@ function TablesView({ role, tables, openOrders, setTables, activeBusinessId, act
     const rect = event.currentTarget.getBoundingClientRect();
     updateTable(dragging.id, { x: Math.max(0, event.clientX - rect.left - dragging.offsetX), y: Math.max(0, event.clientY - rect.top - dragging.offsetY) });
   };
+  const stopDrag = () => {
+    if (dragging) {
+      const table = tables.find((item) => item.id === dragging.id);
+      if (table) void persistTable(table).catch(() => undefined);
+    }
+    setDragging(null);
+  };
   const statusClass = (status: TableStatus) => status === "libre" ? "bg-emerald-100 text-emerald-800 border-emerald-300" : status === "ocupada" ? "bg-orange-100 text-orange-800 border-orange-300" : status === "esperando_pago" ? "bg-sky-100 text-sky-800 border-sky-300" : "bg-slate-200 text-slate-600 border-slate-300";
   return (
     <div className="space-y-5">
@@ -1682,6 +1777,7 @@ function TablesView({ role, tables, openOrders, setTables, activeBusinessId, act
           <button disabled={!canEdit} className="flex min-h-12 items-center gap-2 rounded-md border border-line bg-white px-4 py-2 font-bold disabled:opacity-40" onClick={() => setConfigMode((value) => !value)}><Settings size={20} /> {configMode ? "Cerrar config." : "Configurar mapa"}</button>
         </div>
       </div>
+      {saveError && <p className="rounded-md border border-red-200 bg-red-50 p-3 text-sm font-bold text-red-800">{saveError}</p>}
       {!canSell && <div className="rounded-md border border-yellow-200 bg-yellow-50 p-4 text-yellow-900"><div className="flex flex-wrap items-center justify-between gap-3"><p className="font-bold">No hay turno abierto. Abre turno para comenzar a vender.</p><button disabled={!canOpenShift} className="rounded-md bg-ink px-4 py-2 font-bold text-white disabled:opacity-40" onClick={() => setShowOpenShift(true)}>Abrir turno</button></div></div>}
       {showOpenShift && <div className="rounded-md border border-line bg-white p-4 shadow-soft"><OpenShiftPanel cashier="Caja" onOpen={(amount, note) => { openShift(amount, note); setShowOpenShift(false); }} /></div>}
       {openOrders.length > 0 && (
@@ -1706,31 +1802,31 @@ function TablesView({ role, tables, openOrders, setTables, activeBusinessId, act
       {configMode && (
         <div className="grid gap-3 rounded-md border border-line bg-white p-4 shadow-soft sm:grid-cols-[1fr_auto]">
           <input className="min-h-12 rounded-md border border-line px-3" placeholder="Nombre o numero de mesa" value={name} onChange={(event) => setName(event.target.value)} />
-          <button className="flex min-h-12 items-center justify-center gap-2 rounded-md bg-brand px-4 font-bold text-white" onClick={() => { if (!name.trim()) return; setTables((current) => [...current, { id: createId("table"), businessId: activeBusinessId, name: name.trim(), status: "libre", sortOrder: current.length + 1, x: 60, y: 60, width: 110, height: 90, shape: "rectangle", zone: "Salon" }]); setName(""); }}><Plus size={20} /> Crear mesa</button>
+          <button className="flex min-h-12 items-center justify-center gap-2 rounded-md bg-brand px-4 font-bold text-white" onClick={createTable}><Plus size={20} /> Crear mesa</button>
         </div>
       )}
       <div className="hidden overflow-auto rounded-md border border-line bg-white p-4 shadow-soft md:block">
-        <div className="relative h-[560px] min-w-[760px] rounded-md bg-surface" onMouseMove={dragTable} onMouseUp={() => setDragging(null)} onMouseLeave={() => setDragging(null)}>
+        <div className="relative h-[560px] min-w-[760px] rounded-md bg-surface" onMouseMove={dragTable} onMouseUp={stopDrag} onMouseLeave={stopDrag}>
           {tables.map((table) => {
             const shape = table.shape ?? "rectangle";
             return <div key={table.id} className={`absolute border-2 p-2 shadow-soft ${configMode ? "cursor-move" : ""} ${statusClass(table.status)} ${shape === "circle" ? "rounded-full" : "rounded-md"}`} style={{ left: table.x ?? 40, top: table.y ?? 40, width: table.width ?? 110, height: table.height ?? 90 }} onMouseDown={(event) => startDrag(event, table)}>
               <button className="flex h-full w-full flex-col items-center justify-center text-center" onClick={() => !configMode && tryOpenTable(table)}>
-                {configMode ? <input className="w-full rounded-md border border-line bg-white px-2 py-1 text-center font-black" value={table.name} onChange={(event) => updateTable(table.id, { name: event.target.value })} /> : <strong>{table.name}</strong>}
+                {configMode ? <input className="w-full rounded-md border border-line bg-white px-2 py-1 text-center font-black" value={table.name} onChange={(event) => updateTable(table.id, { name: event.target.value })} onBlur={(event) => saveTablePatch(table.id, { name: event.target.value })} /> : <strong>{table.name}</strong>}
                 <span className="mt-1 text-xs font-bold">{table.zone ?? "Salon"}</span>
               </button>
               {configMode && <div className="absolute left-0 top-full z-10 mt-2 grid w-64 gap-2 rounded-md border border-line bg-white p-2 text-xs shadow-soft">
                 <div className="grid grid-cols-4 gap-1">
-                  <input className="rounded border px-1 py-1" type="number" value={table.x ?? 0} onChange={(event) => updateTable(table.id, { x: Number(event.target.value) || 0 })} />
-                  <input className="rounded border px-1 py-1" type="number" value={table.y ?? 0} onChange={(event) => updateTable(table.id, { y: Number(event.target.value) || 0 })} />
-                  <input className="rounded border px-1 py-1" type="number" value={table.width ?? 110} onChange={(event) => updateTable(table.id, { width: Math.max(60, Number(event.target.value) || 60) })} />
-                  <input className="rounded border px-1 py-1" type="number" value={table.height ?? 90} onChange={(event) => updateTable(table.id, { height: Math.max(50, Number(event.target.value) || 50) })} />
+                  <input className="rounded border px-1 py-1" type="number" value={table.x ?? 0} onChange={(event) => updateTable(table.id, { x: Number(event.target.value) || 0 })} onBlur={(event) => saveTablePatch(table.id, { x: Number(event.target.value) || 0 })} />
+                  <input className="rounded border px-1 py-1" type="number" value={table.y ?? 0} onChange={(event) => updateTable(table.id, { y: Number(event.target.value) || 0 })} onBlur={(event) => saveTablePatch(table.id, { y: Number(event.target.value) || 0 })} />
+                  <input className="rounded border px-1 py-1" type="number" value={table.width ?? 110} onChange={(event) => updateTable(table.id, { width: Math.max(60, Number(event.target.value) || 60) })} onBlur={(event) => saveTablePatch(table.id, { width: Math.max(60, Number(event.target.value) || 60) })} />
+                  <input className="rounded border px-1 py-1" type="number" value={table.height ?? 90} onChange={(event) => updateTable(table.id, { height: Math.max(50, Number(event.target.value) || 50) })} onBlur={(event) => saveTablePatch(table.id, { height: Math.max(50, Number(event.target.value) || 50) })} />
                 </div>
                 <div className="grid grid-cols-3 gap-1">
-                  <select className="rounded border px-1 py-1" value={table.shape ?? "rectangle"} onChange={(event) => updateTable(table.id, { shape: event.target.value as RestaurantTable["shape"] })}><option value="square">Cuadrada</option><option value="rectangle">Rectangular</option><option value="circle">Redonda</option></select>
-                  <select className="rounded border px-1 py-1" value={table.zone ?? "Salon"} onChange={(event) => updateTable(table.id, { zone: event.target.value })}>{zones.map((zone) => <option key={zone} value={zone}>{zone}</option>)}</select>
-                  <select className="rounded border px-1 py-1" value={table.status} onChange={(event) => updateTable(table.id, { status: event.target.value as TableStatus })}><option value="libre">Libre</option><option value="ocupada">Ocupada</option><option value="esperando_pago">Esperando pago</option><option value="bloqueada">Bloqueada</option></select>
+                  <select className="rounded border px-1 py-1" value={table.shape ?? "rectangle"} onChange={(event) => saveTablePatch(table.id, { shape: event.target.value as RestaurantTable["shape"] })}><option value="square">Cuadrada</option><option value="rectangle">Rectangular</option><option value="circle">Redonda</option></select>
+                  <select className="rounded border px-1 py-1" value={table.zone ?? "Salon"} onChange={(event) => saveTablePatch(table.id, { zone: event.target.value })}>{zones.map((zone) => <option key={zone} value={zone}>{zone}</option>)}</select>
+                  <select className="rounded border px-1 py-1" value={table.status} onChange={(event) => saveTablePatch(table.id, { status: event.target.value as TableStatus })}><option value="libre">Libre</option><option value="ocupada">Ocupada</option><option value="esperando_pago">Esperando pago</option><option value="bloqueada">Bloqueada</option></select>
                 </div>
-                <button className="rounded-md border border-red-200 bg-red-50 px-2 py-1 font-bold text-red-800" onClick={() => setTables((current) => current.filter((item) => item.id !== table.id))}>Eliminar</button>
+                <button className="rounded-md border border-red-200 bg-red-50 px-2 py-1 font-bold text-red-800" onClick={() => deleteTable(table)}>Eliminar</button>
               </div>}
             </div>;
           })}
@@ -1741,15 +1837,15 @@ function TablesView({ role, tables, openOrders, setTables, activeBusinessId, act
           <article key={table.id} className="rounded-md border border-line bg-white p-4 shadow-soft">
             <button className="w-full text-left" onClick={() => !configMode && tryOpenTable(table)}>
               <div className="flex items-start justify-between gap-3">
-                {configMode ? <input className="w-full rounded-md border border-line bg-surface px-2 py-2 text-xl font-bold outline-none" value={table.name} onChange={(event) => setTables((current) => current.map((item) => item.id === table.id ? { ...item, name: event.target.value } : item))} /> : <h2 className="text-xl font-bold">{table.name}</h2>}
+                {configMode ? <input className="w-full rounded-md border border-line bg-surface px-2 py-2 text-xl font-bold outline-none" value={table.name} onChange={(event) => updateTable(table.id, { name: event.target.value })} onBlur={(event) => saveTablePatch(table.id, { name: event.target.value })} /> : <h2 className="text-xl font-bold">{table.name}</h2>}
                 <span className={`rounded-md border px-2 py-1 text-xs font-bold ${statusClass(table.status)}`}>{table.status.replace("_", " ")}</span>
               </div>
               <p className="mt-8 text-sm font-semibold text-slate-600">{configMode ? "Editando mapa" : "Tocar para abrir orden"}</p>
             </button>
             {configMode && <div className="mt-3 flex gap-2">
-              <IconButton title="Mover izquierda" onClick={() => updateTable(table.id, { x: (table.x ?? 0) - 20 })}><ArrowUp size={18} /></IconButton>
-              <IconButton title="Mover derecha" onClick={() => updateTable(table.id, { x: (table.x ?? 0) + 20 })}><ArrowDown size={18} /></IconButton>
-              <IconButton title="Eliminar mesa" onClick={() => setTables((current) => current.filter((item) => item.id !== table.id).map((item, index) => ({ ...item, sortOrder: index + 1 })))}><Trash2 size={18} /></IconButton>
+              <IconButton title="Mover izquierda" onClick={() => saveTablePatch(table.id, { x: (table.x ?? 0) - 20 })}><ArrowUp size={18} /></IconButton>
+              <IconButton title="Mover derecha" onClick={() => saveTablePatch(table.id, { x: (table.x ?? 0) + 20 })}><ArrowDown size={18} /></IconButton>
+              <IconButton title="Eliminar mesa" onClick={() => deleteTable(table)}><Trash2 size={18} /></IconButton>
             </div>}
           </article>
         ))}
@@ -1762,8 +1858,88 @@ function MenuManager({ canEdit, activeBusinessId, categories, setCategories, pro
   const [tab, setTab] = useState<MenuTab>("categorias");
   const [search, setSearch] = useState("");
   const [modal, setModal] = useState<null | { type: "category" | "product" | "addition"; id?: string }>(null);
+  const [saveError, setSaveError] = useState("");
   const filteredProducts = products.filter((product) => product.name.toLowerCase().includes(search.toLowerCase()));
   const filteredAdditions = additions.filter((addition) => addition.name.toLowerCase().includes(search.toLowerCase()));
+  async function saveCategory(category: Omit<Category, "id">) {
+    try {
+      const client = requireSupabase();
+      const existing = categories.find((item) => item.id === modal?.id);
+      const id = existing && isUuid(existing.id) ? existing.id : createId("cat");
+      const { error } = await client.from("categories").upsert({ id, business_id: activeBusinessId, name: category.name, sort_order: existing ? categories.findIndex((item) => item.id === existing.id) + 1 : categories.length + 1, active: true, updated_at: now() }, { onConflict: "id" });
+      if (error) throw error;
+      const next = { id, businessId: activeBusinessId, name: category.name };
+      setCategories((current) => existing ? current.map((item) => item.id === existing.id ? next : item) : [...current, next]);
+      setModal(null);
+      setSaveError("");
+    } catch (error) {
+      setSaveError(getDatabaseErrorMessage(error, "No se pudo guardar la categoria en Supabase."));
+    }
+  }
+  async function deleteCategory(category: Category) {
+    try {
+      const client = requireSupabase();
+      const { error } = await client.from("categories").update({ active: false, updated_at: now() }).eq("id", category.id).eq("business_id", activeBusinessId);
+      if (error) throw error;
+      setCategories((current) => current.filter((item) => item.id !== category.id));
+      setSaveError("");
+    } catch (error) {
+      setSaveError(getDatabaseErrorMessage(error, "No se pudo eliminar la categoria en Supabase."));
+    }
+  }
+  async function saveProduct(product: Omit<Product, "id">) {
+    try {
+      const client = requireSupabase();
+      const existing = products.find((item) => item.id === modal?.id);
+      const id = existing && isUuid(existing.id) ? existing.id : createId("prod");
+      const { error } = await client.from("products").upsert({ id, business_id: activeBusinessId, category_id: isUuid(product.categoryId) ? product.categoryId : null, name: product.name, price: product.price, description: product.description, active: product.active, updated_at: now() }, { onConflict: "id" });
+      if (error) throw error;
+      const next = { id, businessId: activeBusinessId, ...product };
+      setProducts((current) => existing ? current.map((item) => item.id === existing.id ? next : item) : [...current, next]);
+      setModal(null);
+      setSaveError("");
+    } catch (error) {
+      setSaveError(getDatabaseErrorMessage(error, "No se pudo guardar el producto en Supabase."));
+    }
+  }
+  async function deleteProduct(product: Product) {
+    try {
+      const client = requireSupabase();
+      const { error } = await client.from("products").update({ active: false, updated_at: now() }).eq("id", product.id).eq("business_id", activeBusinessId);
+      if (error) throw error;
+      setProducts((current) => current.filter((item) => item.id !== product.id));
+      setAdditions((current) => current.map((item) => ({ ...item, productIds: item.productIds.filter((id) => id !== product.id) })));
+      setSaveError("");
+    } catch (error) {
+      setSaveError(getDatabaseErrorMessage(error, "No se pudo eliminar el producto en Supabase."));
+    }
+  }
+  async function saveAddition(addition: Omit<Addition, "id" | "productIds">) {
+    try {
+      const client = requireSupabase();
+      const existing = additions.find((item) => item.id === modal?.id);
+      const id = existing && isUuid(existing.id) ? existing.id : createId("add");
+      const { error } = await client.from("extras").upsert({ id, business_id: activeBusinessId, name: addition.name, price: addition.price, active: true, updated_at: now() }, { onConflict: "id" });
+      if (error) throw error;
+      const next = { id, businessId: activeBusinessId, productIds: existing?.productIds ?? [], ...addition };
+      setAdditions((current) => existing ? current.map((item) => item.id === existing.id ? next : item) : [...current, next]);
+      setModal(null);
+      setSaveError("");
+    } catch (error) {
+      setSaveError(getDatabaseErrorMessage(error, "No se pudo guardar el extra en Supabase."));
+    }
+  }
+  async function deleteAddition(addition: Addition) {
+    try {
+      const client = requireSupabase();
+      const { error } = await client.from("extras").update({ active: false, updated_at: now() }).eq("id", addition.id).eq("business_id", activeBusinessId);
+      if (error) throw error;
+      setAdditions((current) => current.filter((item) => item.id !== addition.id));
+      setSaveError("");
+    } catch (error) {
+      setSaveError(getDatabaseErrorMessage(error, "No se pudo eliminar el extra en Supabase."));
+    }
+  }
   return (
     <div className="space-y-4">
       <InnerTabs current={tab} onChange={setTab} tabs={[
@@ -1772,39 +1948,60 @@ function MenuManager({ canEdit, activeBusinessId, categories, setCategories, pro
         { id: "adiciones", label: "Adiciones / Extras" },
         { id: "vinculos", label: "Vinculacion de extras", icon: <Link2 size={18} /> }
       ]} />
+      {saveError && <p className="rounded-md border border-red-200 bg-red-50 p-3 text-sm font-bold text-red-800">{saveError}</p>}
       {tab !== "vinculos" && <SearchBar value={search} onChange={setSearch} />}
       {tab === "categorias" && (
         <AdminList title="Categorias" addLabel="Crear categoria" canEdit={canEdit} onAdd={() => setModal({ type: "category" })}>
           {categories.filter((category) => category.name.toLowerCase().includes(search.toLowerCase())).map((category) => (
-            <AdminRow key={category.id} title={category.name} detail={`${products.filter((product) => product.categoryId === category.id).length} productos`} canEdit={canEdit} onEdit={() => setModal({ type: "category", id: category.id })} onDelete={() => setCategories((current) => current.filter((item) => item.id !== category.id))} />
+            <AdminRow key={category.id} title={category.name} detail={`${products.filter((product) => product.categoryId === category.id).length} productos`} canEdit={canEdit} onEdit={() => setModal({ type: "category", id: category.id })} onDelete={() => deleteCategory(category)} />
           ))}
         </AdminList>
       )}
       {tab === "productos" && (
         <AdminList title="Productos" addLabel="Crear producto" canEdit={canEdit} onAdd={() => setModal({ type: "product" })}>
           {filteredProducts.map((product) => (
-            <AdminRow key={product.id} title={`${product.name} · ${money.format(product.price)}`} detail={`${categories.find((category) => category.id === product.categoryId)?.name ?? "Sin categoria"} · ${product.active ? "Activo" : "Inactivo"}`} canEdit={canEdit} onEdit={() => setModal({ type: "product", id: product.id })} onDelete={() => setProducts((current) => current.filter((item) => item.id !== product.id))} />
+            <AdminRow key={product.id} title={`${product.name} · ${money.format(product.price)}`} detail={`${categories.find((category) => category.id === product.categoryId)?.name ?? "Sin categoria"} · ${product.active ? "Activo" : "Inactivo"}`} canEdit={canEdit} onEdit={() => setModal({ type: "product", id: product.id })} onDelete={() => deleteProduct(product)} />
           ))}
         </AdminList>
       )}
       {tab === "adiciones" && (
         <AdminList title="Adiciones / Extras" addLabel="Crear extra" canEdit={canEdit} onAdd={() => setModal({ type: "addition" })}>
           {filteredAdditions.map((addition) => (
-            <AdminRow key={addition.id} title={`${addition.name} · ${money.format(addition.price)}`} detail={`${addition.productIds.length} productos vinculados`} canEdit={canEdit} onEdit={() => setModal({ type: "addition", id: addition.id })} onDelete={() => setAdditions((current) => current.filter((item) => item.id !== addition.id))} />
+            <AdminRow key={addition.id} title={`${addition.name} · ${money.format(addition.price)}`} detail={`${addition.productIds.length} productos vinculados`} canEdit={canEdit} onEdit={() => setModal({ type: "addition", id: addition.id })} onDelete={() => deleteAddition(addition)} />
           ))}
         </AdminList>
       )}
-      {tab === "vinculos" && <ExtraLinks canEdit={canEdit} products={products} additions={additions} setAdditions={setAdditions} />}
-      {modal?.type === "category" && <CategoryModal category={categories.find((item) => item.id === modal.id)} onClose={() => setModal(null)} onSave={(category) => { setCategories((current) => modal.id ? current.map((item) => item.id === modal.id ? { ...item, ...category } : item) : [...current, { id: createId("cat"), businessId: activeBusinessId, name: category.name }]); setModal(null); }} />}
-      {modal?.type === "product" && <ProductModal product={products.find((item) => item.id === modal.id)} categories={categories} onClose={() => setModal(null)} onSave={(product) => { setProducts((current) => modal.id ? current.map((item) => item.id === modal.id ? { ...item, ...product } : item) : [...current, { id: createId("prod"), businessId: activeBusinessId, ...product }]); setModal(null); }} />}
-      {modal?.type === "addition" && <AdditionModal addition={additions.find((item) => item.id === modal.id)} onClose={() => setModal(null)} onSave={(addition) => { setAdditions((current) => modal.id ? current.map((item) => item.id === modal.id ? { ...item, ...addition } : item) : [...current, { id: createId("add"), businessId: activeBusinessId, productIds: [], ...addition }]); setModal(null); }} />}
+      {tab === "vinculos" && <ExtraLinks canEdit={canEdit} activeBusinessId={activeBusinessId} products={products} additions={additions} setAdditions={setAdditions} setSaveError={setSaveError} />}
+      {modal?.type === "category" && <CategoryModal category={categories.find((item) => item.id === modal.id)} onClose={() => setModal(null)} onSave={saveCategory} />}
+      {modal?.type === "product" && <ProductModal product={products.find((item) => item.id === modal.id)} categories={categories} onClose={() => setModal(null)} onSave={saveProduct} />}
+      {modal?.type === "addition" && <AdditionModal addition={additions.find((item) => item.id === modal.id)} onClose={() => setModal(null)} onSave={saveAddition} />}
     </div>
   );
 }
 
-function ExtraLinks({ canEdit, products, additions, setAdditions }: { canEdit: boolean; products: Product[]; additions: Addition[]; setAdditions: React.Dispatch<React.SetStateAction<Addition[]>> }) {
+function ExtraLinks({ canEdit, activeBusinessId, products, additions, setAdditions, setSaveError }: { canEdit: boolean; activeBusinessId: string; products: Product[]; additions: Addition[]; setAdditions: React.Dispatch<React.SetStateAction<Addition[]>>; setSaveError: (message: string) => void }) {
   const [productId, setProductId] = useState(products[0]?.id ?? "");
   const product = products.find((item) => item.id === productId);
+  async function toggleLink(addition: Addition, checked: boolean) {
+    if (!productId || !isUuid(productId) || !isUuid(addition.id)) {
+      setSaveError("Guarda primero el producto y el extra en Supabase antes de vincularlos.");
+      return;
+    }
+    try {
+      const client = requireSupabase();
+      if (checked) {
+        const { error } = await client.from("product_extras").delete().eq("business_id", activeBusinessId).eq("product_id", productId).eq("extra_id", addition.id);
+        if (error) throw error;
+      } else {
+        const { error } = await client.from("product_extras").upsert({ business_id: activeBusinessId, product_id: productId, extra_id: addition.id }, { onConflict: "product_id,extra_id" });
+        if (error) throw error;
+      }
+      setAdditions((current) => current.map((item) => item.id === addition.id ? { ...item, productIds: checked ? item.productIds.filter((id) => id !== productId) : Array.from(new Set([...item.productIds, productId])) } : item));
+      setSaveError("");
+    } catch (error) {
+      setSaveError(getDatabaseErrorMessage(error, "No se pudo guardar la vinculacion del extra en Supabase."));
+    }
+  }
   return (
     <section className="rounded-md border border-line bg-white p-4 shadow-soft">
       <div className="grid gap-3 md:grid-cols-[320px_1fr]">
@@ -1819,7 +2016,7 @@ function ExtraLinks({ canEdit, products, additions, setAdditions }: { canEdit: b
           return (
             <label key={addition.id} className={`flex min-h-12 items-center justify-between gap-3 rounded-md border px-3 font-semibold ${checked ? "border-brand bg-emerald-50 text-brand" : "border-line bg-surface"}`}>
               <span>{addition.name} · {money.format(addition.price)}</span>
-              <input disabled={!canEdit} type="checkbox" checked={checked} onChange={() => setAdditions((current) => current.map((item) => item.id === addition.id ? { ...item, productIds: checked ? item.productIds.filter((id) => id !== productId) : [...item.productIds, productId] } : item))} />
+              <input disabled={!canEdit} type="checkbox" checked={checked} onChange={() => toggleLink(addition, checked)} />
             </label>
           );
         })}
@@ -2037,23 +2234,64 @@ function OrdersHistory({ orders, setActiveOrderId, setPrintMode }: { orders: Ord
 
 function SettingsView({ business, setBusiness, settings, setSettings, users, setUsers, invitations, setInvitations, activeBusinessId, currentUser }: { business: Business; setBusiness: React.Dispatch<React.SetStateAction<Business>>; settings: AppSettings; setSettings: React.Dispatch<React.SetStateAction<AppSettings>>; users: BusinessUser[]; setUsers: React.Dispatch<React.SetStateAction<BusinessUser[]>>; invitations: Invitation[]; setInvitations: React.Dispatch<React.SetStateAction<Invitation[]>>; activeBusinessId: string; currentUser: string }) {
   const [tab, setTab] = useState<SettingsTab>("negocio");
+  const [saveError, setSaveError] = useState("");
+  async function persistSettings(next: AppSettings) {
+    try {
+      const client = requireSupabase();
+      const { error } = await client.from("settings").upsert(settingsPayload(activeBusinessId, next), { onConflict: "business_id" });
+      if (error) throw error;
+      setSaveError("");
+    } catch (error) {
+      setSaveError(getDatabaseErrorMessage(error, "No se pudieron guardar los ajustes en Supabase."));
+    }
+  }
+  function updateSettings(updater: (current: AppSettings) => AppSettings) {
+    setSettings((current) => {
+      const next = updater(current);
+      void persistSettings(next);
+      return next;
+    });
+  }
+  async function persistBusiness(patch: Partial<Business>) {
+    try {
+      const client = requireSupabase();
+      const payload: Record<string, unknown> = { updated_at: now() };
+      if ("name" in patch) payload.name = patch.name;
+      if ("commercialName" in patch) payload.commercial_name = patch.commercialName;
+      if ("logoUrl" in patch) payload.logo_url = patch.logoUrl ?? null;
+      if ("address" in patch) payload.address = patch.address;
+      if ("phone" in patch) payload.phone = patch.phone;
+      if ("email" in patch) payload.email = patch.email;
+      if ("nit" in patch) payload.nit = patch.nit;
+      const { error } = await client.from("businesses").update(payload).eq("id", activeBusinessId);
+      if (error) throw error;
+      setSaveError("");
+    } catch (error) {
+      setSaveError(getDatabaseErrorMessage(error, "No se pudieron guardar los datos del negocio en Supabase."));
+    }
+  }
+  function updateBusiness(patch: Partial<Business>) {
+    setBusiness((current) => ({ ...current, ...patch }));
+    void persistBusiness(patch);
+  }
   return (
     <div className="space-y-4">
       <InnerTabs current={tab} onChange={setTab} tabs={[
         { id: "negocio", label: "Negocio" }, { id: "cobro", label: "Cobro" }, { id: "recibo", label: "Recibo" }, { id: "comanda", label: "Comanda" }, { id: "impresion", label: "Impresion" }, { id: "pagos", label: "Metodos de pago" }, { id: "usuarios", label: "Usuarios y permisos" }
       ]} />
-      {tab === "negocio" && <BusinessSettings business={business} setBusiness={setBusiness} />}
-      {tab === "cobro" && <CheckoutSettingsView settings={settings.checkout} setSettings={(checkout) => setSettings((current) => ({ ...current, checkout, receipt: { ...current.receipt, showTip: checkout.tipEnabled } }))} />}
-      {tab === "recibo" && <ReceiptSettingsView business={business} setBusiness={setBusiness} settings={settings.receipt} setSettings={(receipt) => setSettings((current) => ({ ...current, receipt }))} />}
-      {tab === "comanda" && <KitchenSettingsView settings={settings.kitchen} setSettings={(kitchen) => setSettings((current) => ({ ...current, kitchen }))} />}
-      {tab === "impresion" && <PrintingSettingsView settings={settings} setSettings={setSettings} />}
-      {tab === "pagos" && <PaymentSettings methods={settings.paymentMethods} setMethods={(paymentMethods) => setSettings((current) => ({ ...current, paymentMethods }))} />}
-      {tab === "usuarios" && <BusinessUsersSettings businessId={activeBusinessId} users={users} setUsers={setUsers} defaultPermissions={settings.cashierPermissions} setDefaultPermissions={(cashierPermissions) => setSettings((current) => ({ ...current, cashierPermissions }))} />}
+      {saveError && <p className="rounded-md border border-red-200 bg-red-50 p-3 text-sm font-bold text-red-800">{saveError}</p>}
+      {tab === "negocio" && <BusinessSettings business={business} setBusiness={setBusiness} updateBusiness={updateBusiness} setSaveError={setSaveError} />}
+      {tab === "cobro" && <CheckoutSettingsView settings={settings.checkout} setSettings={(checkout) => updateSettings((current) => ({ ...current, checkout, receipt: { ...current.receipt, showTip: checkout.tipEnabled } }))} />}
+      {tab === "recibo" && <ReceiptSettingsView business={business} setBusiness={setBusiness} updateBusiness={updateBusiness} setSaveError={setSaveError} settings={settings.receipt} setSettings={(receipt) => updateSettings((current) => ({ ...current, receipt }))} />}
+      {tab === "comanda" && <KitchenSettingsView settings={settings.kitchen} setSettings={(kitchen) => updateSettings((current) => ({ ...current, kitchen }))} />}
+      {tab === "impresion" && <PrintingSettingsView settings={settings} setSettings={(updater) => updateSettings((current) => typeof updater === "function" ? updater(current) : updater)} />}
+      {tab === "pagos" && <PaymentSettings methods={settings.paymentMethods} setMethods={(paymentMethods) => updateSettings((current) => ({ ...current, paymentMethods }))} />}
+      {tab === "usuarios" && <BusinessUsersSettings businessId={activeBusinessId} users={users} setUsers={setUsers} defaultPermissions={settings.cashierPermissions} setDefaultPermissions={(cashierPermissions) => updateSettings((current) => ({ ...current, cashierPermissions }))} />}
     </div>
   );
 }
 
-function BusinessSettings({ business, setBusiness }: { business: Business; setBusiness: React.Dispatch<React.SetStateAction<Business>> }) {
+function BusinessSettings({ business, setBusiness, updateBusiness, setSaveError }: { business: Business; setBusiness: React.Dispatch<React.SetStateAction<Business>>; updateBusiness: (patch: Partial<Business>) => void; setSaveError: (message: string) => void }) {
   async function uploadLogo(file?: File) {
     if (!file) return;
     if (supabase) {
@@ -2061,17 +2299,19 @@ function BusinessSettings({ business, setBusiness }: { business: Business; setBu
       const { error } = await supabase.storage.from("business-logos").upload(path, file, { upsert: true });
       if (!error) {
         const { data } = supabase.storage.from("business-logos").getPublicUrl(path);
-        setBusiness((current) => ({ ...current, logoUrl: data.publicUrl }));
+        updateBusiness({ logoUrl: data.publicUrl });
         return;
       }
+      setSaveError(getDatabaseErrorMessage(error, "No se pudo subir el logo a Supabase Storage."));
+      return;
     }
     const reader = new FileReader();
     reader.onload = () => setBusiness((current) => ({ ...current, logoUrl: String(reader.result) }));
     reader.readAsDataURL(file);
   }
-  return <SettingsCard title="Negocio"><div className="mb-4 flex flex-wrap items-center gap-3">{business.logoUrl && <img src={business.logoUrl} alt="Logo" className="size-20 rounded-md border border-line object-cover" />}<label className="min-h-11 cursor-pointer rounded-md border border-line bg-white px-4 py-3 font-bold">Subir logo<input className="hidden" type="file" accept="image/*" onChange={(event) => uploadLogo(event.target.files?.[0])} /></label>{business.logoUrl && <button className="min-h-11 rounded-md border border-line px-4 font-bold" onClick={() => setBusiness((current) => ({ ...current, logoUrl: undefined }))}>Quitar logo</button>}<span className="rounded-md bg-surface px-3 py-2 text-sm font-bold">COP · America/Bogota</span></div><div className="grid gap-3 md:grid-cols-2">{[
+  return <SettingsCard title="Negocio"><div className="mb-4 flex flex-wrap items-center gap-3">{business.logoUrl && <img src={business.logoUrl} alt="Logo" className="size-20 rounded-md border border-line object-cover" />}<label className="min-h-11 cursor-pointer rounded-md border border-line bg-white px-4 py-3 font-bold">Subir logo<input className="hidden" type="file" accept="image/*" onChange={(event) => uploadLogo(event.target.files?.[0])} /></label>{business.logoUrl && <button className="min-h-11 rounded-md border border-line px-4 font-bold" onClick={() => updateBusiness({ logoUrl: undefined })}>Quitar logo</button>}<span className="rounded-md bg-surface px-3 py-2 text-sm font-bold">COP · America/Bogota</span></div><div className="grid gap-3 md:grid-cols-2">{[
     ["name", "Nombre del negocio"], ["commercialName", "Nombre comercial"], ["nit", "NIT opcional"], ["logoUrl", "Logo opcional"], ["address", "Direccion"], ["phone", "Telefono"], ["email", "Email"]
-  ].map(([key, label]) => <label key={key} className="space-y-1"><span className="text-sm font-bold">{label}</span><input className="min-h-11 w-full rounded-md border border-line px-3" value={String(business[key as keyof Business] ?? "")} onChange={(event) => setBusiness((current) => ({ ...current, [key]: event.target.value }))} /></label>)}
+  ].map(([key, label]) => <label key={key} className="space-y-1"><span className="text-sm font-bold">{label}</span><input className="min-h-11 w-full rounded-md border border-line px-3" value={String(business[key as keyof Business] ?? "")} onChange={(event) => updateBusiness({ [key]: event.target.value } as Partial<Business>)} /></label>)}
   </div></SettingsCard>;
 }
 
@@ -2092,7 +2332,7 @@ function PrintingSettingsView({ settings, setSettings }: { settings: AppSettings
   </div><PreviewReceipt settings={settings.receipt} /><PreviewKitchen settings={settings.kitchen} /></div></SettingsCard>;
 }
 
-function ReceiptSettingsView({ business, setBusiness, settings, setSettings }: { business: Business; setBusiness: React.Dispatch<React.SetStateAction<Business>>; settings: ReceiptSettings; setSettings: (settings: ReceiptSettings) => void }) {
+function ReceiptSettingsView({ business, setBusiness, updateBusiness, setSaveError, settings, setSettings }: { business: Business; setBusiness: React.Dispatch<React.SetStateAction<Business>>; updateBusiness: (patch: Partial<Business>) => void; setSaveError: (message: string) => void; settings: ReceiptSettings; setSettings: (settings: ReceiptSettings) => void }) {
   async function uploadLogo(file?: File) {
     if (!file) return;
     if (supabase) {
@@ -2100,9 +2340,11 @@ function ReceiptSettingsView({ business, setBusiness, settings, setSettings }: {
       const { error } = await supabase.storage.from("business-logos").upload(path, file, { upsert: true });
       if (!error) {
         const { data } = supabase.storage.from("business-logos").getPublicUrl(path);
-        setBusiness((current) => ({ ...current, logoUrl: data.publicUrl }));
+        updateBusiness({ logoUrl: data.publicUrl });
         return;
       }
+      setSaveError(getDatabaseErrorMessage(error, "No se pudo subir el logo a Supabase Storage."));
+      return;
     }
     const reader = new FileReader();
     reader.onload = () => setBusiness((current) => ({ ...current, logoUrl: String(reader.result) }));
@@ -2115,7 +2357,7 @@ function ReceiptSettingsView({ business, setBusiness, settings, setSettings }: {
     <Toggle label="Mostrar mesa/tipo" checked={settings.showOrderSource} onChange={(value) => setSettings({ ...settings, showOrderSource: value })} />
     <Toggle label="Mostrar notas de productos" checked={settings.showItemNotes} onChange={(value) => setSettings({ ...settings, showItemNotes: value })} />
     <label className="min-h-11 cursor-pointer rounded-md border border-line bg-white px-4 py-3 font-bold">Subir/reemplazar logo<input className="hidden" type="file" accept="image/*" onChange={(event) => uploadLogo(event.target.files?.[0])} /></label>
-    {business.logoUrl && <button className="min-h-11 rounded-md border border-line bg-white px-4 font-bold" onClick={() => setBusiness((current) => ({ ...current, logoUrl: undefined }))}>Quitar logo</button>}
+    {business.logoUrl && <button className="min-h-11 rounded-md border border-line bg-white px-4 font-bold" onClick={() => updateBusiness({ logoUrl: undefined })}>Quitar logo</button>}
     <TextField label="Nombre comercial" value={settings.businessName} onChange={(value) => setSettings({ ...settings, businessName: value })} />
     <TextField label="NIT opcional" value={settings.nit ?? ""} onChange={(value) => setSettings({ ...settings, nit: value })} />
     <TextField label="Direccion" value={settings.address} onChange={(value) => setSettings({ ...settings, address: value })} />
