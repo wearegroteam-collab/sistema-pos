@@ -330,10 +330,19 @@ function normalizeBusiness(business: Partial<Business>): Business {
 }
 
 function methodBucket(method?: PaymentMethod) {
-  if (method === "efectivo") return "cash";
-  if (method === "tarjeta") return "card";
-  if (method === "transferencia" || method === "ATH" || method === "Zelle") return "transfer";
+  const normalized = String(method ?? "").toLowerCase();
+  if (normalized === "efectivo") return "cash";
+  if (normalized === "tarjeta" || normalized.includes("card")) return "card";
+  if (normalized === "transferencia" || normalized === "ath" || normalized === "zelle" || normalized.includes("nequi") || normalized.includes("bancolombia") || normalized.includes("daviplata")) return "transfer";
   return "other";
+}
+
+function paymentMethodCategory(name?: string): "efectivo" | "tarjeta" | "transferencia" | "otro" {
+  const normalized = String(name ?? "").toLowerCase();
+  if (normalized.includes("efectivo") || normalized.includes("cash")) return "efectivo";
+  if (normalized.includes("tarjeta") || normalized.includes("card")) return "tarjeta";
+  if (normalized.includes("transfer") || normalized.includes("ath") || normalized.includes("zelle") || normalized.includes("nequi") || normalized.includes("bancolombia") || normalized.includes("daviplata")) return "transferencia";
+  return "otro";
 }
 
 function getShiftSummary(shift: CashShift, orders: Order[]) {
@@ -484,6 +493,71 @@ function mapShiftRow(row: Record<string, unknown>): CashShift {
   };
 }
 
+function mapPaymentMethodRow(row: Record<string, unknown>): PaymentMethodConfig {
+  const name = String(row.name ?? "Metodo de pago");
+  return {
+    id: String(row.id),
+    businessId: row.business_id ? String(row.business_id) : undefined,
+    name,
+    method: name,
+    active: row.active !== false
+  };
+}
+
+function mapOrderStatus(status: unknown): OrderStatus {
+  if (status === "paid") return "pagada";
+  if (status === "en_cocina") return "comandada";
+  if (status === "pagada" || status === "cancelada" || status === "anulada" || status === "esperando_pago" || status === "comandada") return status;
+  return "abierta";
+}
+
+function mapOrderRow(row: Record<string, unknown>): Order {
+  const orderItems = Array.isArray(row.order_items) ? row.order_items as Record<string, unknown>[] : [];
+  const payments = Array.isArray(row.payments) ? row.payments as Record<string, unknown>[] : [];
+  const payment = payments[0];
+  const paymentMethodName = payment ? String(payment.payment_method_name ?? payment.method ?? "") : undefined;
+  const items: OrderItem[] = orderItems.map((item) => {
+    const extras = Array.isArray(item.order_item_extras) ? item.order_item_extras as Record<string, unknown>[] : [];
+    return {
+      id: String(item.id),
+      testMode: Boolean(item.test_mode),
+      productId: item.product_id ? String(item.product_id) : "",
+      productName: String(item.product_name ?? "Producto"),
+      price: Number(item.unit_price) || 0,
+      quantity: Number(item.quantity) || 1,
+      notes: item.notes ? String(item.notes) : "",
+      additions: extras.map((extra) => ({
+        id: String(extra.id),
+        additionId: extra.extra_id ? String(extra.extra_id) : String(extra.id),
+        name: String(extra.extra_name ?? "Extra"),
+        price: Number(extra.price) || 0
+      }))
+    };
+  });
+  return {
+    id: String(row.id),
+    businessId: String(row.business_id),
+    number: Number(row.order_number) || 0,
+    type: row.type as OrderType,
+    tableId: row.table_id ? String(row.table_id) : undefined,
+    tableName: row.table_name ? String(row.table_name) : undefined,
+    status: mapOrderStatus(row.status),
+    items,
+    subtotal: Number(row.subtotal) || 0,
+    tip: Number(row.tip) || 0,
+    total: Number(row.total) || 0,
+    paymentMethod: paymentMethodName,
+    paymentMethodId: payment?.payment_method_id ? String(payment.payment_method_id) : undefined,
+    paymentMethodName,
+    cashier: row.cashier_name ? String(row.cashier_name) : undefined,
+    shiftId: row.shift_id ? String(row.shift_id) : undefined,
+    testMode: Boolean(row.test_mode),
+    audit: [],
+    createdAt: String(row.created_at ?? now()),
+    closedAt: row.closed_at ? String(row.closed_at) : undefined
+  };
+}
+
 async function getFunctionErrorMessage(error: unknown, fallback: string) {
   const context = (error as { context?: Response })?.context;
   if (context?.json) {
@@ -576,6 +650,7 @@ export function PosApp() {
   const [login, setLogin] = useState({ email: "", password: "" });
   const [loginError, setLoginError] = useState("");
   const [shiftError, setShiftError] = useState("");
+  const [saleError, setSaleError] = useState("");
   const [authLoading, setAuthLoading] = useState(true);
   const [supportBusinessId, setSupportBusinessId] = useState<string | null>(null);
 
@@ -697,6 +772,44 @@ export function PosApp() {
     setShiftError("");
   }
 
+  async function loadBusinessPaymentMethods(businessId: string) {
+    if (!supabase) return;
+    const { data, error } = await supabase
+      .from("payment_methods")
+      .select("id,business_id,name,active,created_at,updated_at")
+      .eq("business_id", businessId)
+      .order("created_at", { ascending: true });
+    if (error) {
+      setSaleError(getDatabaseErrorMessage(error, "No se pudieron cargar los metodos de pago."));
+      return;
+    }
+    if (data?.length) {
+      setSettings((current) => ({ ...current, paymentMethods: data.map((row) => mapPaymentMethodRow(row as Record<string, unknown>)) }));
+    }
+  }
+
+  async function loadBusinessSales(businessId: string, range?: { from?: string; to?: string }) {
+    if (!supabase) return;
+    let query = supabase
+      .from("orders")
+      .select("id,business_id,shift_id,order_number,type,table_id,table_name,status,subtotal,tip,total,cashier_id,cashier_name,test_mode,created_at,closed_at,order_items(id,business_id,order_id,product_id,product_name,unit_price,quantity,notes,test_mode,order_item_extras(id,business_id,order_item_id,extra_id,extra_name,price,test_mode)),payments(id,business_id,order_id,shift_id,method,payment_method_id,payment_method_name,amount,test_mode,paid_at)")
+      .eq("business_id", businessId)
+      .eq("test_mode", false)
+      .order("closed_at", { ascending: false });
+    if (range?.from) query = query.gte("closed_at", `${range.from}T00:00:00-05:00`);
+    if (range?.to) query = query.lte("closed_at", `${range.to}T23:59:59-05:00`);
+    const { data, error } = await query;
+    if (error) {
+      setSaleError(getDatabaseErrorMessage(error, "No se pudieron cargar las ventas desde Supabase."));
+      return;
+    }
+    setOrders((current) => [
+      ...current.filter((order) => order.businessId !== businessId || order.testMode || order.status !== "pagada"),
+      ...(data ?? []).map((row) => mapOrderRow(row as Record<string, unknown>))
+    ]);
+    setSaleError("");
+  }
+
   function closeActiveOrderDrawer() {
     if (activeOrder && !hasOrderItems(activeOrder) && !isClosedOrder(activeOrder)) {
       setOrders((current) => current.filter((order) => order.id !== activeOrder.id));
@@ -768,12 +881,141 @@ export function PosApp() {
     setPrintMode("precuenta");
   }
 
-  function closeOrder(order: Order, method: PaymentMethod) {
+  async function persistPaidOrder(order: Order, method: PaymentMethodConfig) {
+    const client = requireSupabase();
+    const closedAt = now();
+    const calculated = { ...order, ...calculateOrder(order.items, settings.checkout.tipEnabled ? order.tip : 0) };
+    let createdOrder = false;
+    try {
+      const { data: orderRow, error: orderError } = await client
+        .from("orders")
+        .insert({
+          id: order.id,
+          business_id: activeBusinessId,
+          shift_id: activeShift?.id ?? null,
+          type: order.type,
+          table_id: isUuid(order.tableId) ? order.tableId : null,
+          table_name: order.tableName ?? null,
+          status: "pagada",
+          subtotal: calculated.subtotal,
+          tip: calculated.tip,
+          total: calculated.total,
+          cashier_id: session?.userId ?? null,
+          cashier_name: currentUser,
+          test_mode: false,
+          created_at: order.createdAt,
+          closed_at: closedAt,
+          updated_at: closedAt
+        })
+        .select("id,order_number")
+        .single();
+      if (orderError) throw orderError;
+      createdOrder = true;
+
+      const itemRows = calculated.items.map((item) => ({
+        id: item.id,
+        business_id: activeBusinessId,
+        order_id: order.id,
+        product_id: isUuid(item.productId) ? item.productId : null,
+        product_name: item.productName,
+        unit_price: item.price,
+        quantity: item.quantity,
+        notes: item.notes || null,
+        test_mode: false
+      }));
+      const { error: itemsError } = await client.from("order_items").insert(itemRows);
+      if (itemsError) throw itemsError;
+
+      const extraRows = calculated.items.flatMap((item) => item.additions.map((addition) => ({
+        id: addition.id,
+        business_id: activeBusinessId,
+        order_item_id: item.id,
+        extra_id: isUuid(addition.additionId) ? addition.additionId : null,
+        extra_name: addition.name,
+        price: addition.price,
+        test_mode: false
+      })));
+      if (extraRows.length) {
+        const { error: extrasError } = await client.from("order_item_extras").insert(extraRows);
+        if (extrasError) throw extrasError;
+      }
+
+      const { error: paymentError } = await client.from("payments").insert({
+        business_id: activeBusinessId,
+        order_id: order.id,
+        shift_id: activeShift?.id ?? null,
+        method: paymentMethodCategory(method.name),
+        payment_method_id: isUuid(method.id) ? method.id : null,
+        payment_method_name: method.name,
+        amount: calculated.total,
+        test_mode: false,
+        paid_at: closedAt
+      });
+      if (paymentError) throw paymentError;
+
+      const auditRows = [
+        ...order.audit.map((event) => ({
+          business_id: activeBusinessId,
+          order_id: order.id,
+          user_id: session?.userId ?? null,
+          user_name: event.user,
+          action: event.action,
+          reason: event.reason ?? null,
+          metadata: {},
+          test_mode: false,
+          created_at: event.createdAt
+        })),
+        {
+          business_id: activeBusinessId,
+          order_id: order.id,
+          user_id: session?.userId ?? null,
+          user_name: currentUser,
+          action: `Pago registrado: ${method.name}`,
+          reason: null,
+          metadata: { payment_method_id: method.id, payment_method_name: method.name },
+          test_mode: false,
+          created_at: closedAt
+        }
+      ];
+      const { error: auditError } = await client.from("audit_logs").insert(auditRows);
+      if (auditError) throw auditError;
+
+      return {
+        ...calculated,
+        number: Number(orderRow.order_number) || calculated.number,
+        status: "pagada" as OrderStatus,
+        shiftId: activeShift?.id,
+        testMode: false,
+        paymentMethod: method.name,
+        paymentMethodId: method.id,
+        paymentMethodName: method.name,
+        closedAt,
+        audit: [...order.audit, audit(currentUser, `Pago registrado: ${method.name}`)]
+      };
+    } catch (error) {
+      if (createdOrder) await client.from("orders").delete().eq("id", order.id).eq("business_id", activeBusinessId);
+      throw error;
+    }
+  }
+
+  async function closeOrder(order: Order, method: PaymentMethodConfig) {
     if (!can("chargeOrders")) return;
     if (!activeShift && !currentBusiness.testMode) return;
-    updateOrder(order.id, (current) => ({ ...current, status: "pagada", shiftId: currentBusiness.testMode ? undefined : activeShift?.id, testMode: currentBusiness.testMode, paymentMethod: method, closedAt: now(), audit: [...current.audit, audit(currentUser, `Pago registrado: ${method}`)] }));
-    if (order.tableId) setTables((current) => current.map((table) => (table.id === order.tableId ? { ...table, status: "libre" } : table)));
-    setPrintMode("recibo");
+    try {
+      const paidOrder = currentBusiness.testMode
+        ? { ...order, ...calculateOrder(order.items, settings.checkout.tipEnabled ? order.tip : 0), status: "pagada" as OrderStatus, testMode: true, paymentMethod: method.name, paymentMethodId: method.id, paymentMethodName: method.name, closedAt: now(), audit: [...order.audit, audit(currentUser, `Pago registrado: ${method.name}`)] }
+        : await persistPaidOrder(order, method);
+      setOrders((current) => current.map((item) => item.id === order.id ? paidOrder : item));
+      if (order.tableId) setTables((current) => current.map((table) => (table.id === order.tableId ? { ...table, status: "libre" } : table)));
+      setSaleError("");
+      setPrintMode("recibo");
+      if (!currentBusiness.testMode) {
+        await loadBusinessSales(activeBusinessId);
+        await loadBusinessShifts(activeBusinessId);
+      }
+    } catch (error) {
+      setSaleError(getDatabaseErrorMessage(error, "No se pudo guardar la venta en Supabase. La orden sigue abierta."));
+    }
   }
 
   async function openShift(openingAmount: number, openingNote?: string) {
@@ -1040,6 +1282,8 @@ export function PosApp() {
           ...normalizeTables(tableRows.map((row) => ({ id: String(row.id), businessId: String(row.business_id), name: String(row.name), status: row.status as TableStatus, sortOrder: Number(row.sort_order) || 0, x: Number(row.x) || 40, y: Number(row.y) || 40, width: Number(row.width) || 110, height: Number(row.height) || 90, shape: row.shape as RestaurantTable["shape"], zone: row.zone ? String(row.zone) : "Salon" })))
         ]);
       }
+      await loadBusinessPaymentMethods(selectedUser.businessId);
+      await loadBusinessSales(selectedUser.businessId);
       await loadBusinessShifts(selectedUser.businessId);
       setInvitations((current) => current.map((invite) => invite.businessId === selectedUser.businessId && invite.email === selectedUser.email && invite.role === selectedUser.role ? { ...invite, status: "accepted" } : invite));
     }
@@ -1090,6 +1334,8 @@ export function PosApp() {
     setActiveBusinessId(businessId);
     setSupportBusinessId(businessId);
     setTab("vender");
+    await loadBusinessPaymentMethods(businessId);
+    await loadBusinessSales(businessId);
     await loadBusinessShifts(businessId);
     if (supabase && session?.userId) {
       await supabase.from("audit_logs").insert({
@@ -1209,11 +1455,12 @@ export function PosApp() {
 
       <section className="mx-auto max-w-7xl px-4 py-5">
         {shiftError && <p className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm font-bold text-red-800">{shiftError}</p>}
+        {saleError && <p className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm font-bold text-red-800">{saleError}</p>}
         {tab === "dashboard" && (can("viewTables") ? <DashboardView orders={businessOrders} products={businessProducts} /> : <NoPermission />)}
         {tab === "vender" && (can("viewTables") ? <TablesView role={role} tables={orderedTables} openOrders={openBusinessOrders} setTables={setTables} activeBusinessId={activeBusinessId} activeShift={activeShift} testMode={currentBusiness.testMode} canOpenShift={can("openShift")} openShift={openShift} openOrderForTable={openOrderForTable} createDirectOrder={createDirectOrder} openExistingOrder={setActiveOrderId} /> : <NoPermission />)}
         {tab === "ventas" && (can("viewOrders") ? <SalesView orders={businessOrders} shifts={shifts.filter((shift) => (shift.businessId ?? activeBusinessId) === activeBusinessId)} setActiveOrderId={setActiveOrderId} setPrintMode={setPrintMode} /> : <NoPermission />)}
         {tab === "menu" && (can("modifyMenu") ? <MenuManager canEdit={can("modifyMenu")} activeBusinessId={activeBusinessId} categories={businessCategories} setCategories={setCategories} products={businessProducts} setProducts={setProducts} additions={businessAdditions} setAdditions={setAdditions} /> : <NoPermission />)}
-        {tab === "reportes" && (can("viewReports") ? <ReportsView orders={businessOrders.filter((order) => order.status === "pagada")} shifts={shifts.filter((shift) => (shift.businessId ?? activeBusinessId) === activeBusinessId)} /> : <NoPermission />)}
+        {tab === "reportes" && (can("viewReports") ? <ReportsView business={currentBusiness} orders={businessOrders.filter((order) => order.status === "pagada")} shifts={shifts.filter((shift) => (shift.businessId ?? activeBusinessId) === activeBusinessId)} onLoadSales={(range) => loadBusinessSales(activeBusinessId, range)} /> : <NoPermission />)}
         {tab === "ajustes" && (can("modifySettings") ? <SettingsView business={currentBusiness} setBusiness={(updater) => setBusinesses((current) => current.map((item) => item.id === activeBusinessId ? (typeof updater === "function" ? updater(item) : updater) : item))} settings={settings} setSettings={setSettings} users={businessUsers.filter((user) => user.businessId === activeBusinessId)} setUsers={setBusinessUsers} invitations={invitations.filter((invitation) => invitation.businessId === activeBusinessId)} setInvitations={setInvitations} activeBusinessId={activeBusinessId} currentUser={currentUser} /> : <NoPermission />)}
       </section>
 
@@ -2163,7 +2410,7 @@ function ExtraLinks({ canEdit, activeBusinessId, products, additions, setAdditio
   );
 }
 
-function OrderDrawer({ business, settings, activeShift, role, can, currentUser, order, categories, products, additions, printMode, setPrintMode, onClose, addProduct, updateOrder, appendAudit, confirmKitchen, printPrecheck, closeOrder, cancelOrder }: { business: Business; settings: AppSettings; activeShift: CashShift | null; role: Role; can: (permission: keyof CashierPermissions) => boolean; currentUser: string; order: Order; categories: Category[]; products: Product[]; additions: Addition[]; printMode: PrintMode; setPrintMode: (mode: PrintMode) => void; onClose: () => void; addProduct: (product: Product) => void; updateOrder: (orderId: string, updater: (order: Order) => Order) => void; appendAudit: (orderId: string, action: string, reason?: string) => void; confirmKitchen: (order: Order) => void; printPrecheck: (order: Order) => void; closeOrder: (order: Order, method: PaymentMethod) => void; cancelOrder: (order: Order, reason: string) => void }) {
+function OrderDrawer({ business, settings, activeShift, role, can, currentUser, order, categories, products, additions, printMode, setPrintMode, onClose, addProduct, updateOrder, appendAudit, confirmKitchen, printPrecheck, closeOrder, cancelOrder }: { business: Business; settings: AppSettings; activeShift: CashShift | null; role: Role; can: (permission: keyof CashierPermissions) => boolean; currentUser: string; order: Order; categories: Category[]; products: Product[]; additions: Addition[]; printMode: PrintMode; setPrintMode: (mode: PrintMode) => void; onClose: () => void; addProduct: (product: Product) => void; updateOrder: (orderId: string, updater: (order: Order) => Order) => void; appendAudit: (orderId: string, action: string, reason?: string) => void; confirmKitchen: (order: Order) => void; printPrecheck: (order: Order) => void; closeOrder: (order: Order, method: PaymentMethodConfig) => void; cancelOrder: (order: Order, reason: string) => void }) {
   const [search, setSearch] = useState("");
   const [categoryId, setCategoryId] = useState("all");
   const [paying, setPaying] = useState(false);
@@ -2254,7 +2501,7 @@ function OrderItemEditor({ currentUser, order, item, additions, updateOrder, app
   );
 }
 
-function PaymentBox({ settings, order, updateOrder, closeOrder }: { settings: AppSettings; order: Order; updateOrder: (orderId: string, updater: (order: Order) => Order) => void; closeOrder: (order: Order, method: PaymentMethod) => void }) {
+function PaymentBox({ settings, order, updateOrder, closeOrder }: { settings: AppSettings; order: Order; updateOrder: (orderId: string, updater: (order: Order) => Order) => void; closeOrder: (order: Order, method: PaymentMethodConfig) => void }) {
   return (
     <div className="mt-4 rounded-md border border-line bg-surface p-3">
       {settings.checkout.tipEnabled && (
@@ -2275,8 +2522,8 @@ function PaymentBox({ settings, order, updateOrder, closeOrder }: { settings: Ap
       )}
       <div className="mt-3 grid gap-2 sm:grid-cols-2">
         {settings.paymentMethods.filter((method) => method.active).map((method) => (
-          <button key={method.id} className="flex min-h-12 items-center justify-center gap-2 rounded-md border border-line bg-white px-3 font-bold hover:border-brand" onClick={() => closeOrder(order, method.method)}>
-            {method.method === "tarjeta" ? <CreditCard size={18} /> : <Banknote size={18} />}{method.name}
+          <button key={method.id} className="flex min-h-12 items-center justify-center gap-2 rounded-md border border-line bg-white px-3 font-bold hover:border-brand" onClick={() => closeOrder(order, method)}>
+            {paymentMethodCategory(method.name) === "tarjeta" ? <CreditCard size={18} /> : <Banknote size={18} />}{method.name}
           </button>
         ))}
       </div>
@@ -2423,7 +2670,7 @@ function SettingsView({ business, setBusiness, settings, setSettings, users, set
       {tab === "recibo" && <ReceiptSettingsView business={business} setBusiness={setBusiness} updateBusiness={updateBusiness} setSaveError={setSaveError} settings={settings.receipt} setSettings={(receipt) => updateSettings((current) => ({ ...current, receipt }))} />}
       {tab === "comanda" && <KitchenSettingsView settings={settings.kitchen} setSettings={(kitchen) => updateSettings((current) => ({ ...current, kitchen }))} />}
       {tab === "impresion" && <PrintingSettingsView settings={settings} setSettings={(updater) => updateSettings((current) => typeof updater === "function" ? updater(current) : updater)} />}
-      {tab === "pagos" && <PaymentSettings methods={settings.paymentMethods} setMethods={(paymentMethods) => updateSettings((current) => ({ ...current, paymentMethods }))} />}
+      {tab === "pagos" && <PaymentSettings activeBusinessId={activeBusinessId} methods={settings.paymentMethods} setMethods={(paymentMethods) => updateSettings((current) => ({ ...current, paymentMethods }))} />}
       {tab === "usuarios" && <BusinessUsersSettings businessId={activeBusinessId} users={users} setUsers={setUsers} defaultPermissions={settings.cashierPermissions} setDefaultPermissions={(cashierPermissions) => updateSettings((current) => ({ ...current, cashierPermissions }))} />}
     </div>
   );
@@ -2516,10 +2763,50 @@ function KitchenSettingsView({ settings, setSettings }: { settings: KitchenSetti
   </div><PreviewKitchen settings={settings} /></div></SettingsCard>;
 }
 
-function PaymentSettings({ methods, setMethods }: { methods: PaymentMethodConfig[]; setMethods: (methods: PaymentMethodConfig[]) => void }) {
+function PaymentSettings({ activeBusinessId, methods, setMethods }: { activeBusinessId: string; methods: PaymentMethodConfig[]; setMethods: (methods: PaymentMethodConfig[]) => void }) {
   const [name, setName] = useState("");
-  const [method, setMethod] = useState<PaymentMethod>("otro");
-  return <SettingsCard title="Metodos de pago"><div className="grid gap-3 md:grid-cols-[1fr_220px_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Nombre" value={name} onChange={(event) => setName(event.target.value)} /><select className="min-h-11 rounded-md border border-line px-3" value={method} onChange={(event) => setMethod(event.target.value as PaymentMethod)}>{["efectivo", "tarjeta", "transferencia", "ATH", "Zelle", "otro"].map((item) => <option key={item} value={item}>{item}</option>)}</select><button className="min-h-11 rounded-md bg-brand px-4 font-bold text-white" onClick={() => { if (!name.trim()) return; setMethods([...methods, { id: createId("pay"), name, method, active: true }]); setName(""); }}>Crear</button></div><div className="mt-4 space-y-2">{methods.map((item) => <div key={item.id} className="grid gap-2 rounded-md border border-line p-3 md:grid-cols-[1fr_160px_120px_auto]"><input className="min-h-10 rounded-md border border-line px-3 font-semibold" value={item.name} onChange={(event) => setMethods(methods.map((row) => row.id === item.id ? { ...row, name: event.target.value } : row))} /><span className="rounded-md bg-surface px-3 py-2 text-sm font-bold">{item.method}</span><button className={`rounded-md px-3 font-bold ${item.active ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-700"}`} onClick={() => setMethods(methods.map((row) => row.id === item.id ? { ...row, active: !row.active } : row))}>{item.active ? "Activo" : "Inactivo"}</button><IconButton title="Eliminar" onClick={() => setMethods(methods.filter((row) => row.id !== item.id))}><Trash2 size={18} /></IconButton></div>)}</div></SettingsCard>;
+  const [error, setError] = useState("");
+  async function saveMethod(method: PaymentMethodConfig) {
+    const next = { ...method, name: method.name.trim(), method: method.name.trim() };
+    if (!next.name) return;
+    try {
+      const client = requireSupabase();
+      const id = isUuid(next.id) ? next.id : createId("pay");
+      const { data, error } = await client
+        .from("payment_methods")
+        .upsert({ id, business_id: activeBusinessId, name: next.name, active: next.active, updated_at: now() }, { onConflict: "id" })
+        .select("id,business_id,name,active,created_at,updated_at")
+        .single();
+      if (error) throw error;
+      const saved = mapPaymentMethodRow(data as Record<string, unknown>);
+      setMethods(methods.some((item) => item.id === method.id) ? methods.map((item) => item.id === method.id ? saved : item) : [...methods, saved]);
+      setName("");
+      setError("");
+    } catch (error) {
+      setError(getDatabaseErrorMessage(error, "No se pudo guardar el metodo de pago."));
+    }
+  }
+  async function deleteMethod(method: PaymentMethodConfig) {
+    try {
+      const client = requireSupabase();
+      const { count, error: countError } = await client.from("payments").select("id", { count: "exact", head: true }).eq("business_id", activeBusinessId).eq("payment_method_id", method.id);
+      if (countError) throw countError;
+      if ((count ?? 0) > 0) {
+        const { error } = await client.from("payment_methods").update({ active: false, updated_at: now() }).eq("id", method.id).eq("business_id", activeBusinessId);
+        if (error) throw error;
+        setMethods(methods.map((item) => item.id === method.id ? { ...item, active: false } : item));
+        setError("Este metodo tiene ventas asociadas; se desactivo en lugar de eliminarse.");
+        return;
+      }
+      const { error } = await client.from("payment_methods").delete().eq("id", method.id).eq("business_id", activeBusinessId);
+      if (error) throw error;
+      setMethods(methods.filter((item) => item.id !== method.id));
+      setError("");
+    } catch (error) {
+      setError(getDatabaseErrorMessage(error, "No se pudo eliminar el metodo de pago."));
+    }
+  }
+  return <SettingsCard title="Metodos de pago"><div className="grid gap-3 md:grid-cols-[1fr_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Nombre del metodo: NEQUI, Bancolombia, Daviplata..." value={name} onChange={(event) => setName(event.target.value)} /><button className="min-h-11 rounded-md bg-brand px-4 font-bold text-white" onClick={() => saveMethod({ id: createId("pay"), businessId: activeBusinessId, name, method: name, active: true })}>Crear</button></div>{error && <p className="mt-3 rounded-md bg-yellow-50 p-3 text-sm font-bold text-yellow-900">{error}</p>}<div className="mt-4 space-y-2">{methods.map((item) => <div key={item.id} className="grid gap-2 rounded-md border border-line p-3 md:grid-cols-[1fr_120px_auto]"><input className="min-h-10 rounded-md border border-line px-3 font-semibold" value={item.name} onChange={(event) => setMethods(methods.map((row) => row.id === item.id ? { ...row, name: event.target.value, method: event.target.value } : row))} onBlur={(event) => saveMethod({ ...item, name: event.currentTarget.value, method: event.currentTarget.value })} /><button className={`rounded-md px-3 font-bold ${item.active ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-700"}`} onClick={() => saveMethod({ ...item, active: !item.active })}>{item.active ? "Activo" : "Inactivo"}</button><IconButton title="Eliminar" onClick={() => deleteMethod(item)}><Trash2 size={18} /></IconButton></div>)}</div></SettingsCard>;
 }
 
 function UsersPermissionsSettings({ businessId, users, setUsers, invitations, setInvitations, invitedBy, defaultPermissions, setDefaultPermissions }: { businessId: string; users: BusinessUser[]; setUsers: React.Dispatch<React.SetStateAction<BusinessUser[]>>; invitations: Invitation[]; setInvitations: React.Dispatch<React.SetStateAction<Invitation[]>>; invitedBy: string; defaultPermissions: CashierPermissions; setDefaultPermissions: (permissions: CashierPermissions) => void }) {
@@ -2562,21 +2849,48 @@ function BusinessUsersSettings({ businessId, users, setUsers, defaultPermissions
   return <div className="space-y-4"><SettingsCard title="Crear usuario"><div className="grid gap-3 md:grid-cols-[1fr_1fr_160px_auto]"><input className="min-h-11 rounded-md border border-line px-3" placeholder="Correo" value={draft.email} onChange={(event) => setDraft({ ...draft, email: event.target.value })} /><input className="min-h-11 rounded-md border border-line px-3" placeholder="Nombre" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /><select className="min-h-11 rounded-md border border-line px-3" value={draft.role} onChange={(event) => setDraft({ ...draft, role: event.target.value as Role })}><option value="admin">Admin</option><option value="supervisor">Supervisor</option><option value="cajero">Cajero</option></select><button disabled={!draft.email.trim()} className="min-h-11 rounded-md bg-brand px-4 font-bold text-white disabled:opacity-40" onClick={createUser}>Crear</button></div>{status && <p className="mt-3 rounded-md bg-surface p-3 text-sm font-bold">{status}</p>}{credentials && <div className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm font-bold text-emerald-900"><p>Correo: {credentials.email}</p><p>Contrasena temporal: {credentials.password}</p><button className="mt-2 rounded-md bg-emerald-700 px-3 py-2 text-white" onClick={() => navigator.clipboard.writeText(`Correo: ${credentials.email}\nContrasena temporal: ${credentials.password}`)}>Copiar credenciales</button></div>}</SettingsCard><SettingsCard title="Usuarios"><div className="space-y-3">{users.map((user) => <div key={user.id} className="rounded-md border border-line p-3"><div className="grid gap-2 md:grid-cols-[1fr_150px_130px_auto]"><div><p className="font-bold">{user.name}</p><p className="text-sm text-slate-600">{user.email}{user.forcePasswordChange ? " · debe cambiar contrasena" : ""}</p></div><select className="min-h-10 rounded-md border border-line px-3" value={user.role} onChange={(event) => setUsers((current) => current.map((item) => item.id === user.id ? { ...item, role: event.target.value as Role } : item))}><option value="admin">Admin</option><option value="supervisor">Supervisor</option><option value="cajero">Cajero</option></select><button className={`rounded-md px-3 font-bold ${user.status === "active" ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-700"}`} onClick={() => setUsers((current) => current.map((item) => item.id === user.id ? { ...item, status: item.status === "active" ? "inactive" : "active" } : item))}>{user.status === "active" ? "Activo" : "Inactivo"}</button><button className="rounded-md border border-line px-3 py-2 font-bold" onClick={() => resetPassword(user)}>Resetear</button></div>{user.role === "cajero" && <div className="mt-3 grid gap-2 md:grid-cols-2">{(Object.keys(permissionLabels) as (keyof CashierPermissions)[]).map((key) => <Toggle key={key} label={permissionLabels[key]} checked={user.permissions[key]} onChange={(value) => setUsers((current) => current.map((item) => item.id === user.id ? { ...item, permissions: { ...item.permissions, [key]: value } } : item))} />)}</div>}</div>)}</div></SettingsCard><SettingsCard title="Permisos predeterminados de cajero"><div className="grid gap-3 md:grid-cols-2">{(Object.keys(permissionLabels) as (keyof CashierPermissions)[]).map((key) => <Toggle key={key} label={permissionLabels[key]} checked={defaultPermissions[key]} onChange={(value) => setDefaultPermissions({ ...defaultPermissions, [key]: value })} />)}</div></SettingsCard></div>;
 }
 
-function ReportsView({ orders, shifts }: { orders: Order[]; shifts: CashShift[] }) {
+function escapeHtml(value: string) {
+  return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[char] ?? char));
+}
+
+function openPdfReport(title: string, business: Business, activeRange: { from: string; to: string }, report: { total: number; count: number; average: number; tips: number; byMethod: Record<string, number>; byDay: Record<string, number>; products: [string, number][] }, orders: Order[], shifts: CashShift[]) {
+  const rows = (items: [string, string][]) => items.map(([name, value]) => `<tr><td>${escapeHtml(name)}</td><td>${escapeHtml(value)}</td></tr>`).join("");
+  const orderRows = orders.map((order) => `<tr><td>#${order.number}</td><td>${escapeHtml(formatDateTime(order.closedAt ?? order.createdAt))}</td><td>${escapeHtml(order.tableName ?? order.type)}</td><td>${escapeHtml(order.paymentMethodName ?? order.paymentMethod ?? "-")}</td><td>${money.format(order.total)}</td></tr>`).join("");
+  const html = `<!doctype html><html><head><title>${escapeHtml(title)}</title><style>body{font-family:Arial,sans-serif;margin:32px;color:#111827}h1{margin:0 0 4px}h2{margin-top:28px}table{width:100%;border-collapse:collapse;margin-top:10px}td,th{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:20px 0}.metric{border:1px solid #e5e7eb;padding:12px}.value{font-size:20px;font-weight:700}@media print{button{display:none}}</style></head><body><button onclick="window.print()">Guardar / imprimir PDF</button><h1>${escapeHtml(title)}</h1><p>${escapeHtml(business.name)} · ${activeRange.from} / ${activeRange.to}</p><p>Generado: ${escapeHtml(formatDateTime(now()))}</p><div class="metrics"><div class="metric">Total<div class="value">${money.format(report.total)}</div></div><div class="metric">Ordenes<div class="value">${report.count}</div></div><div class="metric">Ticket promedio<div class="value">${money.format(report.average)}</div></div><div class="metric">Propinas<div class="value">${money.format(report.tips)}</div></div></div><h2>Ventas por metodo de pago</h2><table>${rows(Object.entries(report.byMethod).map(([name, total]) => [name, money.format(total)]))}</table><h2>Ventas por dia</h2><table>${rows(Object.entries(report.byDay).map(([name, total]) => [name, money.format(total)]))}</table><h2>Productos mas vendidos</h2><table>${rows(report.products.map(([name, quantity]) => [name, String(quantity)]))}</table><h2>Listado de ventas</h2><table><thead><tr><th>Orden</th><th>Fecha</th><th>Mesa/tipo</th><th>Metodo</th><th>Total</th></tr></thead><tbody>${orderRows}</tbody></table><h2>Cierres de caja</h2><table>${rows(shifts.map((shift) => [formatDateTime(shift.openedAt), `${shift.status} · ${shift.cashier}`]))}</table><script>setTimeout(() => window.print(), 300)</script></body></html>`;
+  const popup = window.open("", "_blank");
+  if (!popup) return;
+  popup.document.write(html);
+  popup.document.close();
+}
+
+function summarizeOrdersForReport(source: Order[]) {
+  const total = source.reduce((sum, order) => sum + order.total, 0);
+  const tips = source.reduce((sum, order) => sum + order.tip, 0);
+  const byMethod = groupTotals(source, (order) => order.paymentMethodName ?? order.paymentMethod ?? "sin metodo", (order) => order.total);
+  const byType = groupTotals(source, (order) => order.type, (order) => order.total);
+  const byDay = groupTotals(source, (order) => (order.closedAt ?? order.createdAt).slice(0, 10), (order) => order.total);
+  const products = source.flatMap((order) => order.items).reduce<Record<string, number>>((acc, item) => ({ ...acc, [item.productName]: (acc[item.productName] ?? 0) + item.quantity }), {});
+  return { total, count: source.length, average: source.length ? total / source.length : 0, tips, byMethod, byType, byDay, products: Object.entries(products).sort((a, b) => b[1] - a[1]).slice(0, 8) };
+}
+
+function ReportsView({ business, orders, shifts, onLoadSales }: { business: Business; orders: Order[]; shifts: CashShift[]; onLoadSales: (range: { from: string; to: string }) => Promise<void> }) {
   const [preset, setPreset] = useState<DatePreset>("hoy");
   const [mode, setMode] = useState<"real" | "test" | "both">("real");
   const [range, setRange] = useState(getPresetRange("hoy"));
+  const [filters, setFilters] = useState({ method: "all", cashier: "all", type: "all" });
   const activeRange = preset === "rango" ? range : getPresetRange(preset);
-  const filtered = orders.filter((order) => inDateRange(order.closedAt ?? order.createdAt, activeRange.from, activeRange.to) && (mode === "both" || (mode === "test" ? order.testMode : !order.testMode)));
-  const report = useMemo(() => {
-    const total = filtered.reduce((sum, order) => sum + order.total, 0);
-    const byMethod = groupTotals(filtered, (order) => order.paymentMethod ?? "sin metodo", (order) => order.total);
-    const byType = groupTotals(filtered, (order) => order.type, (order) => order.total);
-    const byDay = groupTotals(filtered, (order) => (order.closedAt ?? order.createdAt).slice(0, 10), (order) => order.total);
-    const products = filtered.flatMap((order) => order.items).reduce<Record<string, number>>((acc, item) => ({ ...acc, [item.productName]: (acc[item.productName] ?? 0) + item.quantity }), {});
-    return { total, count: filtered.length, average: filtered.length ? total / filtered.length : 0, byMethod, byType, byDay, products: Object.entries(products).sort((a, b) => b[1] - a[1]).slice(0, 8) };
-  }, [filtered]);
-  return <div className="space-y-5"><section className="rounded-md border border-line bg-white p-4 shadow-soft"><h1 className="flex items-center gap-2 text-2xl font-bold"><CalendarDays size={24} /> Reportes</h1><DatePresetButtons preset={preset} setPreset={setPreset} /><div className="mt-3 flex flex-wrap gap-2"><button className={`min-h-10 rounded-md border px-4 font-bold ${mode === "real" ? "border-brand bg-brand text-white" : "border-line"}`} onClick={() => setMode("real")}>Datos reales</button><button className={`min-h-10 rounded-md border px-4 font-bold ${mode === "test" ? "border-brand bg-brand text-white" : "border-line"}`} onClick={() => setMode("test")}>Datos de prueba</button><button className={`min-h-10 rounded-md border px-4 font-bold ${mode === "both" ? "border-brand bg-brand text-white" : "border-line"}`} onClick={() => setMode("both")}>Ambos</button></div>{preset === "rango" && <DateRangeInputs range={range} setRange={setRange} />}</section><div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"><Metric title="Ventas totales" value={money.format(report.total)} /><Metric title="Numero de ordenes" value={String(report.count)} /><Metric title="Ticket promedio" value={money.format(report.average)} /><Metric title="Periodo" value={`${activeRange.from} / ${activeRange.to}`} /></div><div className="grid gap-5 lg:grid-cols-2"><ReportList title="Ventas por metodo de pago" rows={Object.entries(report.byMethod).map(([name, total]) => [name, money.format(total)])} /><ReportList title="Ventas por dia" rows={Object.entries(report.byDay).map(([name, total]) => [name, money.format(total)])} /><ReportList title="Productos mas vendidos" rows={report.products.map(([name, quantity]) => [name, String(quantity)])} /><ReportList title="Ventas por tipo de orden" rows={Object.entries(report.byType).map(([name, total]) => [name, money.format(total)])} /></div><ShiftHistory shifts={shifts.filter((shift) => mode === "both" || (mode === "test" ? shift.testMode : !shift.testMode))} orders={orders} /></div>;
+  useEffect(() => {
+    if (mode === "test") return;
+    void onLoadSales(activeRange);
+  }, [activeRange.from, activeRange.to, mode]);
+  const filtered = orders.filter((order) => inDateRange(order.closedAt ?? order.createdAt, activeRange.from, activeRange.to) && (mode === "both" || (mode === "test" ? order.testMode : !order.testMode)) && (filters.method === "all" || (order.paymentMethodName ?? order.paymentMethod) === filters.method) && (filters.cashier === "all" || order.cashier === filters.cashier) && (filters.type === "all" || order.type === filters.type));
+  const cashiers = Array.from(new Set(orders.map((order) => order.cashier).filter(Boolean))) as string[];
+  const methods = Array.from(new Set(orders.map((order) => order.paymentMethodName ?? order.paymentMethod).filter(Boolean))) as string[];
+  const report = useMemo(() => summarizeOrdersForReport(filtered), [filtered]);
+  const monthRange = getPresetRange("mes");
+  const monthFiltered = filtered.filter((order) => inDateRange(order.closedAt ?? order.createdAt, monthRange.from, monthRange.to));
+  const monthReport = summarizeOrdersForReport(monthFiltered);
+  return <div className="space-y-5"><section className="rounded-md border border-line bg-white p-4 shadow-soft"><div className="flex flex-wrap items-center justify-between gap-3"><h1 className="flex items-center gap-2 text-2xl font-bold"><CalendarDays size={24} /> Reportes</h1><div className="flex flex-wrap gap-2"><button className="min-h-10 rounded-md bg-ink px-4 font-bold text-white" onClick={() => openPdfReport("Extracto de ventas", business, activeRange, report, filtered, shifts)}>Descargar extracto PDF</button><button className="min-h-10 rounded-md border border-line bg-white px-4 font-bold" onClick={() => openPdfReport("Ventas del mes", business, monthRange, monthReport, monthFiltered, shifts)}>Descargar ventas del mes PDF</button></div></div><DatePresetButtons preset={preset} setPreset={setPreset} /><div className="mt-3 flex flex-wrap gap-2"><button className={`min-h-10 rounded-md border px-4 font-bold ${mode === "real" ? "border-brand bg-brand text-white" : "border-line"}`} onClick={() => setMode("real")}>Datos reales</button><button className={`min-h-10 rounded-md border px-4 font-bold ${mode === "test" ? "border-brand bg-brand text-white" : "border-line"}`} onClick={() => setMode("test")}>Datos de prueba</button><button className={`min-h-10 rounded-md border px-4 font-bold ${mode === "both" ? "border-brand bg-brand text-white" : "border-line"}`} onClick={() => setMode("both")}>Ambos</button></div>{preset === "rango" && <DateRangeInputs range={range} setRange={setRange} />}<div className="mt-3 grid gap-3 md:grid-cols-3"><select className="min-h-11 rounded-md border border-line px-3" value={filters.method} onChange={(event) => setFilters({ ...filters, method: event.target.value })}><option value="all">Todos los metodos</option>{methods.map((method) => <option key={method} value={method}>{method}</option>)}</select><select className="min-h-11 rounded-md border border-line px-3" value={filters.cashier} onChange={(event) => setFilters({ ...filters, cashier: event.target.value })}><option value="all">Todos los cajeros</option>{cashiers.map((cashier) => <option key={cashier} value={cashier}>{cashier}</option>)}</select><select className="min-h-11 rounded-md border border-line px-3" value={filters.type} onChange={(event) => setFilters({ ...filters, type: event.target.value })}><option value="all">Todos los tipos</option><option value="mesa">Mesa</option><option value="pickup">Pickup</option><option value="delivery">Delivery</option></select></div></section><div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"><Metric title="Ventas totales" value={money.format(report.total)} /><Metric title="Numero de ordenes" value={String(report.count)} /><Metric title="Ticket promedio" value={money.format(report.average)} /><Metric title="Propinas" value={money.format(report.tips)} /></div><div className="grid gap-5 lg:grid-cols-2"><ReportList title="Ventas por metodo de pago" rows={Object.entries(report.byMethod).map(([name, total]) => [name, money.format(total)])} /><ReportList title="Ventas por dia" rows={Object.entries(report.byDay).map(([name, total]) => [name, money.format(total)])} /><ReportList title="Productos mas vendidos" rows={report.products.map(([name, quantity]) => [name, String(quantity)])} /><ReportList title="Ventas por tipo de orden" rows={Object.entries(report.byType).map(([name, total]) => [name, money.format(total)])} /></div><ShiftHistory shifts={shifts.filter((shift) => mode === "both" || (mode === "test" ? shift.testMode : !shift.testMode))} orders={orders} /></div>;
 }
 
 function PrintModal({ business, settings, order, mode, role, onClose, onPrint }: { business: Business; settings: AppSettings; order: Order; mode: Exclude<PrintMode, null>; role: Role; onClose: () => void; onPrint: (label: string) => void }) {

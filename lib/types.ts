@@ -6,7 +6,7 @@ export type TableStatus = "libre" | "ocupada" | "esperando_pago" | "bloqueada";
 export type TableShape = "square" | "rectangle" | "circle";
 export type OrderType = "mesa" | "pickup" | "delivery";
 export type OrderStatus = "abierta" | "comandada" | "esperando_pago" | "pagada" | "cancelada" | "anulada";
-export type PaymentMethod = "efectivo" | "tarjeta" | "transferencia" | "ATH" | "Zelle" | "otro";
+export type PaymentMethod = string;
 export type ReceiptSize = "58mm" | "80mm";
 export type KitchenSize = "58mm" | "80mm";
 export type PrintType = "browser";
@@ -89,6 +89,8 @@ export type Order = {
   tip: number;
   total: number;
   paymentMethod?: PaymentMethod;
+  paymentMethodId?: string;
+  paymentMethodName?: string;
   cashier?: string;
   shiftId?: string;
   testMode?: boolean;
@@ -148,6 +150,7 @@ export type KitchenSettings = {
 
 export type PaymentMethodConfig = {
   id: string;
+  businessId?: string;
   name: string;
   method: PaymentMethod;
   active: boolean;

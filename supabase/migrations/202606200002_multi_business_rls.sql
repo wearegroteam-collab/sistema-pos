@@ -53,6 +53,7 @@ alter table public.businesses enable row level security;
 alter table public.business_users enable row level security;
 alter table public.invitations enable row level security;
 alter table public.settings enable row level security;
+alter table public.payment_methods enable row level security;
 alter table public.categories enable row level security;
 alter table public.products enable row level security;
 alter table public.extras enable row level security;
@@ -90,6 +91,11 @@ with check (public.is_business_admin(business_id));
 
 drop policy if exists settings_access on public.settings;
 create policy settings_access on public.settings
+for all using (public.can_access_business(business_id))
+with check (public.can_access_business(business_id));
+
+drop policy if exists payment_methods_access on public.payment_methods;
+create policy payment_methods_access on public.payment_methods
 for all using (public.can_access_business(business_id))
 with check (public.can_access_business(business_id));
 
